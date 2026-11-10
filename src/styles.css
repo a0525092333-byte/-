@@ -1,0 +1,211 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── נס מולטימדיה — warm paper workspace, deep indigo accent ─────────────── */
+:root {
+  --radius: 0.875rem;
+  --font-body: "Heebo", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-heading: "Heebo", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --background: #f5f4ef;
+  --foreground: #1f1f1d;
+  --card: #ffffff;
+  --card-foreground: #1f1f1d;
+  --popover: #ffffff;
+  --popover-foreground: #1f1f1d;
+  --primary: #3b3f8f;
+  --primary-foreground: #ffffff;
+  --secondary: #ecebe4;
+  --secondary-foreground: #2b2b28;
+  --muted: #efeee8;
+  --muted-foreground: #6f6f6e;
+  --accent: #e9e8f6;
+  --accent-foreground: #2f3273;
+  --destructive: #c0392b;
+  --border: #e2e1d8;
+  --input: #d9d8cf;
+  --ring: #3b3f8f;
+  /* Single source of truth for the fixed mobile bottom nav height. */
+  --bottom-nav-height: calc(3.5rem + max(0.5rem, env(safe-area-inset-bottom)));
+  --mobile-header-height: 4.0625rem;
+}
+
+.dark {
+  --background: #17171a;
+  --foreground: #f4f3ee;
+  --card: #202024;
+  --card-foreground: #f4f3ee;
+  --popover: #202024;
+  --popover-foreground: #f4f3ee;
+  --primary: #8b8fe8;
+  --primary-foreground: #17171a;
+  --secondary: #2a2a30;
+  --secondary-foreground: #f4f3ee;
+  --muted: #2a2a30;
+  --muted-foreground: #a3a3a0;
+  --accent: #2f3273;
+  --accent-foreground: #e9e8f6;
+  --destructive: #e06a5c;
+  --border: #33333a;
+  --input: #3a3a42;
+  --ring: #8b8fe8;
+}
+
+@theme inline {
+  --font-sans: var(--font-body);
+  --font-display: var(--font-heading);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "kern" 1;
+    min-height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior-y: auto;
+  }
+  #root {
+    min-height: 100%;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font-family: inherit;
+  }
+}
+
+@layer utilities {
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+  .safe-bottom {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .card-soft {
+    box-shadow: 0 1px 2px rgba(31, 31, 29, 0.04), 0 8px 24px -18px rgba(31, 31, 29, 0.18);
+  }
+}
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 14mm;
+  }
+  body {
+    background: #fff !important;
+  }
+  aside,
+  nav,
+  header,
+  .print-hidden {
+    display: none !important;
+  }
+  main {
+    padding: 0 !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  .print-report {
+    color: #111 !important;
+  }
+  .print-report .card-soft {
+    box-shadow: none !important;
+    border: 1px solid #ddd !important;
+    break-inside: avoid;
+  }
+  .print-report table {
+    font-size: 10px !important;
+  }
+}
+
+@media print {
+  .quote-document {
+    color: #000 !important;
+    background: #fff !important;
+  }
+  .quote-document table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .quote-document thead {
+    display: table-header-group;
+  }
+  .quote-document tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .quote-totals {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
+/* Brand logo on issued/printed documents — fixed height, colour-safe print. */
+.brand-logo-print {
+  height: 3rem;
+  width: auto;
+  max-width: 9rem;
+  object-fit: contain;
+  break-inside: avoid;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
+/* Large centred brand logo on issued documents. */
+.brand-logo-print-lg {
+  height: 7rem;
+  width: auto;
+  max-width: 60%;
+  object-fit: contain;
+  break-inside: avoid;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
