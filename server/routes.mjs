@@ -3286,7 +3286,9 @@ async function deleteEventRoute({ headers, env, db, id }) {
 }
 
 function neonAuthBase(env) {
-  const data = String(env.NEON_DATA_API_URL || "");
+  const explicit = String(env.NEON_AUTH_URL || env.VITE_NEON_AUTH_URL || "").trim().replace(/\/+$/, "");
+  if (explicit && !explicit.includes("ep-xxx")) return explicit;
+  const data = String(env.NEON_DATA_API_URL || env.VITE_NEON_DATA_API_URL || "").trim();
   const match = data.match(/^https:\/\/([^.]+)\.apirest\.([^/]+)\/([^/]+)\/rest\/v1\/?$/);
   if (match) return `https://${match[1]}.neonauth.${match[2]}/${match[3]}/auth`;
   return null;

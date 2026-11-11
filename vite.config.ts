@@ -7,7 +7,7 @@ import path from "node:path";
 // Static SPA build (NO SSR). `vite build` → dist/ (index.html + assets/*).
 // dist/ is what we upload to GCS (preview) / R2 (publish). No server runs.
 //
-// `base: "./"` — emit RELATIVE asset paths (`./assets/*`) instead of the
+// `base: "/"` — emit RELATIVE asset paths (`./assets/*`) instead of the
 // default absolute `/assets/*`. The in-chat preview serves the built tree
 // from a per-turn Cloud Storage prefix (`…/site/index.html`); with relative
 // paths the assets resolve against that prefix, with absolute paths they'd
