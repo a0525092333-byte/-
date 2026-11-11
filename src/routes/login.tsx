@@ -337,16 +337,15 @@ function Login() {
         }
       >
         <div className="space-y-3">
-          <Field label="כתובת אימייל" htmlFor="forgot-email">
+          <
+          Field label="כתובת אימייל" htmlFor="forgot-email">
             <Input
-              id="forgot-email"
-              type="email"
-              dir="ltr"
-              value={forgotEmail}
-              onChange={(e) => setForgotEmail(e.target.value)}
-              placeholder="name@company.co.il"
-              autoComplete="email"
-              className="h-11 text-start"
+  id="forgot-email"
+  type="email"
+  dir="ltr"
+  value={forgotEmail}
+  readOnly
+  className="h-11 text-start bg-muted"
             />
           </Field>
           {forgotMessage ? (
