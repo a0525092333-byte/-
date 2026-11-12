@@ -61,12 +61,10 @@ function clean(value: string): string {
     .trim();
 }
 
-/** pdf.js often splits gershayim into separate runs: "סה \" כ" -> "סה\"כ". */
 function normalizeGershayim(value: string): string {
   return value.replace(/ð/g, "נ").replace(/\s*(["״׳'])\s*/g, "$1");
 }
 
-/** Merge runs that pdf.js split apart (e.g. "סה" + '"' + "כ") before matching. */
 function coalesceRuns(runs: ExtractedRun[]): ExtractedRun[] {
   const out: ExtractedRun[] = [];
   for (const run of runs) {
@@ -118,11 +116,9 @@ function parseDate(value: string): string | null {
   if (match) {
     const currentYear = new Date().getFullYear();
     const candidates: string[] = [];
-    // dd/mm/yy
     const yearA = match[3].length === 2 ? `20${match[3]}` : match[3];
     const ddmm = isoDate(yearA, match[2], match[1]);
     if (ddmm) candidates.push(ddmm);
-    // yy/mm/dd — RTL extraction can reverse the three groups.
     if (match[1].length <= 2) {
       const yymm = isoDate(`20${match[1]}`, match[2], match[3]);
       if (yymm) candidates.push(yymm);
@@ -284,7 +280,6 @@ function formatVenue(value: string): string {
 
 function normalizeVenue(value: string): string {
   let text = value.replace(/ð/g, "נ").replace(/\s+/g, " ").trim();
-  // The PDF font maps נ to ð and sometimes emits a leading ב prefix.
   text = text.replace(/^בב(?=נ)/, "ב");
   return formatVenue(stripVenuePrefix(text));
 }
@@ -536,29 +531,4 @@ function rowCells(line: ExtractedLine, columns: Partial<Record<ColumnKey, Column
     if (key) buckets[key].push({ text: run.text, x: run.x, width: run.width });
   }
   const joinAsc = (items: { text: string; x: number; width: number }[]) =>
-    items.sort((a, b) => a.x - b.x).map((item) => item.text).join("");
-  return {
-    name: joinRunsRtl(buckets.name),
-    unitPriceText: joinAsc(buckets.unit_price),
-    qtyText: joinAsc(buckets.qty),
-    totalText: joinAsc(buckets.total),
-  };
-}
-
-function parseItemRow(
-  line: ExtractedLine,
-  columns: Partial<Record<ColumnKey, ColumnRange>>,
-  sectionIndex: number,
-): ParsedItem | null {
-  const cells = rowCells(line, columns);
-  const qty = parseNumber(cells.qtyText);
-  const unitPrice = parseNumber(cells.unitPriceText);
-  const total = parseNumber(cells.totalText);
-  const rawName = stripBullets(cells.name);
-  if (!rawName && !qty && !unitPrice && !total) return null;
-  let name = rawName;
-  let description: string | null = null;
-  const paren = rawName.search(/[()]/);
-  if (paren > 0) {
-    name = rawName.slice(0, paren).trim();
-    description = stripBullets(rawName.slice(paren));
+    items.sort((a, b) => a.
