@@ -531,4 +531,290 @@ function rowCells(line: ExtractedLine, columns: Partial<Record<ColumnKey, Column
     if (key) buckets[key].push({ text: run.text, x: run.x, width: run.width });
   }
   const joinAsc = (items: { text: string; x: number; width: number }[]) =>
-    items.sort((a, b) => a.
+    items.sort((a, b) => a.x - b.x).map((item) => item.text).join("");
+  return {
+    name: joinRunsRtl(buckets.name),
+    unitPriceText: joinAsc(buckets.unit_price),
+    qtyText: joinAsc(buckets.qty),
+    totalText: joinAsc(buckets.total),
+  };
+}
+
+function parseItemRow(
+  line: ExtractedLine,
+  columns: Partial<Record<ColumnKey, ColumnRange>>,
+  sectionIndex: number,
+): ParsedItem | null {
+  const cells = rowCells(line, columns);
+  const qty = parseNumber(cells.qtyText);
+  const unitPrice = parseNumber(cells.unitPriceText);
+  const total = parseNumber(cells.totalText);
+  const rawName = stripBullets(cells.name);
+  if (!rawName && !qty && !unitPrice && !total) return null;
+  let name = rawName;
+  let description: string | null = null;
+  const paren = rawName.search(/[()]/);
+  if (paren > 0) {
+    name = rawName.slice(0, paren).trim();
+    description = stripBullets(rawName.slice(paren));
+  }
+  const quantity = qty || (unitPrice ? 1 : 0);
+  const lineTotal = total || Math.round(qty * unitPrice * 100) / 100;
+  return {
+    name: name || "פריט",
+    description,
+    qty: quantity,
+    quantity,
+    unit: null,
+    unit_price: unitPrice,
+    unitPrice,
+    line_total: lineTotal,
+    lineTotal,
+    sectionIndex,
+  };
+}
+
+function isTableHeader(text: string): boolean {
+  return text.includes("פריט") && text.includes("כמות") && text.includes("מחיר");
+}
+
+function parseItems(entries: { page: ExtractedLine; text: string }[]): {
+  items: ParsedItem[];
+  sections: ParsedSection[];
+} {
+  const items: ParsedItem[] = [];
+  const sections: ParsedSection[] = [{ name: "כללי", sort_order: 0 }];
+  let sectionIndex = 0;
+  let headerIndex = -1;
+  let columns: Partial<Record<ColumnKey, ColumnRange>> = {};
+
+  for (let i = 0; i < entries.length; i++) {
+    if (isTableHeader(entries[i].text)) {
+      headerIndex = i;
+      columns = headerColumns(entries[i].page);
+      break;
+    }
+  }
+  if (headerIndex === -1) return { items, sections };
+  const swapDimensions = entries[headerIndex].text.includes("#");
+
+  for (let i = headerIndex + 1; i < entries.length; i++) {
+    const entry = entries[i];
+    const text = entry.text;
+    if (isStop(text) || /^תאריך/.test(text) || /^חתימה/.test(text)) break;
+    if (isTableHeader(text)) continue;
+
+    const cells = rowCells(entry.page, columns);
+    const nameText = stripBullets(cells.name);
+    const hasNumbers = /\d/.test(cells.unitPriceText + cells.qtyText + cells.totalText);
+    const qty = parseNumber(cells.qtyText);
+    const unitPrice = parseNumber(cells.unitPriceText);
+    const total = parseNumber(cells.totalText);
+    const allZero = !qty && !unitPrice && !total;
+
+    if (nameText.endsWith(":") && allZero) {
+      const name = nameText.replace(/[:：]\s*$/, "").trim();
+      if (name) {
+        sections.push({ name, sort_order: sections.length });
+        sectionIndex = sections.length - 1;
+      }
+      continue;
+    }
+
+    if (hasNumbers) {
+      const item = parseItemRow(entry.page, columns, sectionIndex);
+      if (item) items.push(item);
+      continue;
+    }
+
+    if (items.length) {
+      const last = items[items.length - 1];
+      const rawContinuation = fixLatinPrefix(textFromRuns(entry.page));
+      const hasBullet = /^[\s\-–—•·]/.test(rawContinuation);
+      const continuation = stripBullets(rawContinuation);
+      if (continuation) {
+        if (last.description) {
+          const combined = `${last.description} ${continuation}`;
+          const shortMirrored = /^\)/.test(last.description) && /\($/.test(continuation) && combined.length <= 24;
+          if (shortMirrored) {
+            last.name = `${last.name} ${combined}`;
+            last.description = null;
+          } else {
+            last.description = combined;
+          }
+        } else if (hasBullet) {
+          last.description = continuation;
+        } else {
+          last.name = `${last.name} ${continuation}`;
+        }
+      }
+    }
+  }
+
+  for (const item of items) {
+    item.name = fixBrackets(fixPunctuationSpacing(fixHebrewDigitSpacing(item.name)));
+    if (swapDimensions) {
+      item.name = item.name.replace(/(\d+(?:\.\d+)?)\*(\d+(?:\.\d+)?)/, (_, a, b) => `${b}*${a}`);
+    }
+    if (item.description) item.description = fixBrackets(fixPunctuationSpacing(item.description));
+  }
+
+  return { items, sections };
+}
+
+function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
+  subtotal: number | null;
+  discountType: "percent" | "amount";
+  discountValue: number;
+  discountAmount: number;
+  totalBeforeVat: number | null;
+  vatRate: number;
+  vatAmount: number | null;
+  grandTotal: number | null;
+} {
+  let subtotal: number | null = null;
+  let discountType: "percent" | "amount" = "percent";
+  let discountValue = 0;
+  let discountAmount = 0;
+  let totalBeforeVat: number | null = null;
+  let vatRate = 18;
+  let vatAmount: number | null = null;
+  let grandTotal: number | null = null;
+
+  for (const entry of entries) {
+    const compact = entry.text.replace(/\s+/g, "");
+    const groups = numericGroups(entry.page);
+    if ((compact.includes('סה"כ') || compact.includes("סךהכול")) && compact.includes("הנחה") && !compact.includes("מחירלפני")) {
+      if (groups[0] != null) subtotal = groups[0];
+    } else if (compact.includes("הנחה") && (compact.includes("%") || /0\.\d+/.test(compact) || groups.length > 1)) {
+      discountType = "percent";
+      discountAmount = groups[0] ?? 0;
+      discountValue = groups[1] ?? groups[0] ?? 0;
+    } else if (compact.includes("הנחה")) {
+      discountType = "amount";
+      discountValue = groups[0] ?? 0;
+      discountAmount = groups[0] ?? 0;
+    } else if (compact.includes("מחירלפני") && compact.includes("מע")) {
+      if (groups[0] != null) totalBeforeVat = groups[0];
+    } else if (compact.includes('מע"מ') && compact.includes("%")) {
+      vatRate = groups[groups.length - 1] ?? 18;
+      vatAmount = groups.length >= 2 ? groups[groups.length - 2] : null;
+      grandTotal = groups[0] ?? null;
+    } else if (compact.includes("מחיר כולל") || compact.includes("מחירכולל")) {
+      if (groups[0] != null) grandTotal = groups[0];
+    }
+  }
+
+  return { subtotal, discountType, discountValue, discountAmount, totalBeforeVat, vatRate, vatAmount, grandTotal };
+}
+
+function parseNotes(entries: { page: ExtractedLine; text: string }[]): string | null {
+  const start = entries.findIndex((entry) => entry.text.trim().startsWith("הערות"));
+  if (start === -1) return null;
+  const parts: string[] = [];
+  for (let i = start + 1; i < entries.length; i++) {
+    const text = entries[i].text;
+    const compact = text.replace(/\s+/g, "");
+    if (compact.includes("תנאי")) break;
+    if (/^חתימה/.test(text) || /^תאריך/.test(text)) break;
+    const line = stripBullets(fixLatinPrefix(textFromRuns(entries[i].page)));
+    if (line) parts.push(line);
+  }
+  return parts.length ? parts.join("\n") : null;
+}
+
+export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
+  const entries = pages
+    .map((page) => ({ page, text: normalizeGershayim(clean(page.text)) }))
+    .filter((entry) => entry.text);
+  const lines = entries.map((entry) => entry.text);
+  const rawText = lines.join("\n");
+  const warnings: string[] = [];
+
+  const rawClientName = firstValue(lines, ["לכבוד", "שם הלקוח", "לקוח:"]);
+  const clientName = rawClientName ? fixClientName(rawClientName) : null;
+  if (!clientName) warnings.push("לא זוהה שם לקוח");
+
+  const clientPhone = normalizePhone(firstValue(lines, ["נייד", "טלפון", "נייד:"]));
+
+  const venue = parseVenue(entries);
+  if (!venue) warnings.push("לא זוהה מקום האירוע");
+
+  const eventDate = firstDate(
+    lines,
+    ["תאריך האירוע", "תאריך הארוע", "בתאריך", "מועד", "תאריך"],
+    ["הצעה", "הפקה", "הדפסה"],
+  );
+  if (!eventDate) warnings.push("לא זוהה תאריך האירוע");
+
+  const quoteDate = firstDate(lines, ["ת. הצעה", "ת.הצעה", "תאריך הצעה", "תאריך הפקה"]);
+  if (!quoteDate) warnings.push("לא זוהה תאריך ההצעה");
+
+  const quoteNumber = parseQuoteNumber(lines);
+  if (!quoteNumber) warnings.push("לא זוהה מספר הצעה");
+
+  const guestValue = firstValue(lines, ["כמות מוזמנים", "מס' אורחים", "אורחים"]);
+  const guestCount = guestValue ? parseNumber(guestValue) || null : null;
+
+  const clientAddress = parseClientAddress(lines);
+  const eventAddress = firstValue(lines, ["כתובת האירוע", "כתובת הארוע"]);
+
+  const { items, sections } = parseItems(entries);
+  if (!items.length) warnings.push("לא זוהו פריטים בהצעה");
+
+  const printed = parseTotals(entries);
+  const notes = parseNotes(entries);
+  const terms = collectTerms(lines);
+
+  const round2 = (value: number) => Math.round((Number(value) || 0) * 100) / 100;
+  const itemsSubtotal = round2(items.reduce((sum, item) => sum + item.line_total, 0));
+  let subtotal = printed.subtotal ?? itemsSubtotal;
+  if (printed.subtotal != null && Math.abs(itemsSubtotal - printed.subtotal) > 1) {
+    warnings.push(
+      `סכום הפריטים (${itemsSubtotal.toLocaleString("he-IL")}) אינו תואם לסה"כ המודפס (${printed.subtotal.toLocaleString("he-IL")})`,
+    );
+  }
+  
+  let discountType = printed.discountType;
+  let discountValue = printed.discountValue;
+  let discountAmount = printed.discountAmount;
+
+  if (discountAmount === 0 && printed.totalBeforeVat != null && itemsSubtotal > printed.totalBeforeVat) {
+    discountAmount = round2(itemsSubtotal - printed.totalBeforeVat);
+    discountType = "amount";
+    discountValue = discountAmount;
+    subtotal = itemsSubtotal;
+  }
+
+  const totalBeforeVat = printed.totalBeforeVat ?? round2(Math.max(0, subtotal - discountAmount));
+  const vatRate = printed.vatRate;
+  const vatAmount = printed.vatAmount ?? round2(totalBeforeVat * ((Number(vatRate) || 0) / 100));
+  const grandTotal = printed.grandTotal ?? Math.round(totalBeforeVat + vatAmount);
+
+  return {
+    clientName,
+    clientPhone,
+    venue,
+    eventDate,
+    quoteDate,
+    quoteNumber,
+    guestCount,
+    address: clientAddress,
+    clientAddress,
+    eventAddress,
+    items,
+    sections,
+    discountType,
+    discountValue,
+    discountAmount,
+    subtotal,
+    totalBeforeVat,
+    vatRate,
+    vatAmount,
+    grandTotal,
+    notes,
+    terms,
+    warnings,
+    rawText,
+  };
+}
