@@ -61,10 +61,12 @@ function clean(value: string): string {
     .trim();
 }
 
+/** pdf.js often splits gershayim into separate runs: "סה \" כ" -> "סה\"כ". */
 function normalizeGershayim(value: string): string {
   return value.replace(/ð/g, "נ").replace(/\s*(["״׳'])\s*/g, "$1");
 }
 
+/** Merge runs that pdf.js split apart (e.g. "סה" + '"' + "כ") before matching. */
 function coalesceRuns(runs: ExtractedRun[]): ExtractedRun[] {
   const out: ExtractedRun[] = [];
   for (const run of runs) {
@@ -116,9 +118,11 @@ function parseDate(value: string): string | null {
   if (match) {
     const currentYear = new Date().getFullYear();
     const candidates: string[] = [];
+    // dd/mm/yy
     const yearA = match[3].length === 2 ? `20${match[3]}` : match[3];
     const ddmm = isoDate(yearA, match[2], match[1]);
     if (ddmm) candidates.push(ddmm);
+    // yy/mm/dd — RTL extraction can reverse the three groups.
     if (match[1].length <= 2) {
       const yymm = isoDate(`20${match[1]}`, match[2], match[3]);
       if (yymm) candidates.push(yymm);
@@ -251,7 +255,9 @@ function numericGroups(line: ExtractedLine): number[] {
     const last = groups[groups.length - 1];
     if (last) {
       const prev = last[last.length - 1];
-      if (run.x - (prev.x + prev.width) < 25) {
+      const joinedLast = last.map((item) => item.text).join("").trim();
+      const endsWithCents = /\.\d{2}$/.test(joinedLast);
+      if (!endsWithCents && run.x - (prev.x + prev.width) < 12) {
         last.push(run);
         continue;
       }
@@ -280,6 +286,7 @@ function formatVenue(value: string): string {
 
 function normalizeVenue(value: string): string {
   let text = value.replace(/ð/g, "נ").replace(/\s+/g, " ").trim();
+  // The PDF font maps נ to ð and sometimes emits a leading ב prefix.
   text = text.replace(/^בב(?=נ)/, "ב");
   return formatVenue(stripVenuePrefix(text));
 }
@@ -662,6 +669,14 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
   return { items, sections };
 }
 
+function normalizeTotalsLine(text: string): string {
+  return text
+    .replace(/\s+/g, "")
+    .replace(/[:：]/g, "")
+    .replace(/חהנה|החנה/g, "הנחה")
+    .replace(/ינלפ|ינפל/g, "לפני");
+}
+
 function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
   subtotal: number | null;
   discountType: "percent" | "amount";
@@ -682,25 +697,30 @@ function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
   let grandTotal: number | null = null;
 
   for (const entry of entries) {
-    const compact = entry.text.replace(/\s+/g, "");
+    const compact = normalizeTotalsLine(entry.text);
     const groups = numericGroups(entry.page);
     if ((compact.includes('סה"כ') || compact.includes("סךהכול")) && compact.includes("הנחה") && !compact.includes("מחירלפני")) {
       if (groups[0] != null) subtotal = groups[0];
-    } else if (compact.includes("הנחה") && (compact.includes("%") || /0\.\d+/.test(compact) || groups.length > 1)) {
+    } else if (compact.includes("הנחה") && !compact.includes("לפני") && compact.includes("%")) {
       discountType = "percent";
-      discountAmount = groups[0] ?? 0;
-      discountValue = groups[1] ?? groups[0] ?? 0;
-    } else if (compact.includes("הנחה")) {
+      if (groups.length >= 2) {
+        discountAmount = groups[0] ?? 0;
+        discountValue = groups[1] ?? 0;
+      } else {
+        discountValue = groups[0] ?? 0;
+        discountAmount = 0;
+      }
+    } else if (compact.includes("הנחה") && !compact.includes("לפני")) {
       discountType = "amount";
       discountValue = groups[0] ?? 0;
       discountAmount = groups[0] ?? 0;
-    } else if (compact.includes("מחירלפני") && compact.includes("מע")) {
+    } else if (compact.includes("מחיר") && compact.includes("לפני") && compact.includes("מע")) {
       if (groups[0] != null) totalBeforeVat = groups[0];
     } else if (compact.includes('מע"מ') && compact.includes("%")) {
       vatRate = groups[groups.length - 1] ?? 18;
       vatAmount = groups.length >= 2 ? groups[groups.length - 2] : null;
       grandTotal = groups[0] ?? null;
-    } else if (compact.includes("מחיר כולל") || compact.includes("מחירכולל")) {
+    } else if (compact.includes("מחירכולל")) {
       if (groups[0] != null) grandTotal = groups[0];
     }
   }
@@ -768,25 +788,41 @@ export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
 
   const round2 = (value: number) => Math.round((Number(value) || 0) * 100) / 100;
   const itemsSubtotal = round2(items.reduce((sum, item) => sum + item.line_total, 0));
-  let subtotal = printed.subtotal ?? itemsSubtotal;
+  const subtotal = printed.subtotal ?? itemsSubtotal;
   if (printed.subtotal != null && Math.abs(itemsSubtotal - printed.subtotal) > 1) {
     warnings.push(
       `סכום הפריטים (${itemsSubtotal.toLocaleString("he-IL")}) אינו תואם לסה"כ המודפס (${printed.subtotal.toLocaleString("he-IL")})`,
     );
   }
-  
+
   let discountType = printed.discountType;
   let discountValue = printed.discountValue;
   let discountAmount = printed.discountAmount;
 
-  if (discountAmount === 0 && printed.totalBeforeVat != null && itemsSubtotal > printed.totalBeforeVat) {
-    discountAmount = round2(itemsSubtotal - printed.totalBeforeVat);
-    discountType = "amount";
-    discountValue = discountAmount;
-    subtotal = itemsSubtotal;
+  if (discountType === "percent" && discountValue > 0 && discountAmount === 0) {
+    discountAmount = round2(subtotal * (discountValue / 100));
+  } else if (discountType === "percent" && discountValue > 0 && discountAmount > 0) {
+    // אם האחוז המודפס מעוגל (כמו 20.28%) והסכום השקלי מדויק (26,450), נשמור כהנחת סכום לדיוק מלא
+    const expectedFromPercent = round2(subtotal * (discountValue / 100));
+    if (Math.abs(expectedFromPercent - discountAmount) > 0.05) {
+      discountType = "amount";
+      discountValue = discountAmount;
+    }
   }
 
-  const totalBeforeVat = printed.totalBeforeVat ?? round2(Math.max(0, subtotal - discountAmount));
+  const inferredBeforeVat =
+    printed.totalBeforeVat ??
+    (printed.grandTotal != null && printed.vatAmount != null
+      ? round2(printed.grandTotal - printed.vatAmount)
+      : null);
+
+  if (discountValue === 0 && discountAmount === 0 && inferredBeforeVat != null && subtotal - inferredBeforeVat > 1) {
+    discountAmount = round2(subtotal - inferredBeforeVat);
+    discountType = "amount";
+    discountValue = discountAmount;
+  }
+
+  const totalBeforeVat = inferredBeforeVat ?? round2(Math.max(0, subtotal - discountAmount));
   const vatRate = printed.vatRate;
   const vatAmount = printed.vatAmount ?? round2(totalBeforeVat * ((Number(vatRate) || 0) / 100));
   const grandTotal = printed.grandTotal ?? Math.round(totalBeforeVat + vatAmount);
