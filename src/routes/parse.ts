@@ -246,10 +246,27 @@ function textFromRuns(line: ExtractedLine): string {
   return joinRunsRtl(runs);
 }
 
+function extractNumbersFromString(value: string): number[] {
+  const cleaned = clean(value)
+    .replace(/₪/g, "")
+    .replace(/ש["״']?ח/g, "")
+    .replace(/\s/g, "");
+  const parts = cleaned.match(/-?\d[\d,]*\.\d{2}(?=\d)|-?\d[\d,]*(?:\.\d+)?/g) ?? [];
+  const out: number[] = [];
+  for (const part of parts) {
+    const num = Number(part.replace(/,/g, ""));
+    if (!Number.isNaN(num)) out.push(num);
+  }
+  return out;
+}
+
 function numericGroups(line: ExtractedLine): number[] {
   const runs = (line.runs ?? [])
     .filter((run) => /[\d.,]/.test(run.text) && !/^[₪%]+$/.test(run.text.trim()))
     .sort((a, b) => a.x - b.x);
+  if (!runs.length) {
+    return extractNumbersFromString(line.text);
+  }
   const groups: { text: string; x: number; width: number }[][] = [];
   for (const run of runs) {
     const last = groups[groups.length - 1];
@@ -264,7 +281,11 @@ function numericGroups(line: ExtractedLine): number[] {
     }
     groups.push([run]);
   }
-  return groups.map((group) => parseNumber(group.map((run) => run.text).join("")));
+  const out: number[] = [];
+  for (const group of groups) {
+    out.push(...extractNumbersFromString(group.map((run) => run.text).join("")));
+  }
+  return out;
 }
 
 const VENUE_NOUNS = ["מלון", "אולם", "גני", "גן", "בית", "מתחם", "מרכז", "מועדון", "כפר", "אצטדיון", "היכל"];
@@ -672,8 +693,11 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
 function normalizeTotalsLine(text: string): string {
   return text
     .replace(/\s+/g, "")
+    .replace(/[״"]/g, '"')
+    .replace(/[׳']/g, "'")
     .replace(/[:：]/g, "")
-    .replace(/חהנה|החנה/g, "הנחה")
+    .replace(/לפנהינחה/g, "לפניהנחה")
+    .replace(/חהנה|החנה|הנהח|נהחה/g, "הנחה")
     .replace(/ינלפ|ינפל/g, "לפני");
 }
 
@@ -696,32 +720,69 @@ function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
   let vatAmount: number | null = null;
   let grandTotal: number | null = null;
 
-  for (const entry of entries) {
+  let headerIdx = -1;
+  for (let i = 0; i < entries.length; i++) {
+    if (isTableHeader(entries[i].text)) {
+      headerIdx = i;
+      break;
+    }
+  }
+  let startIdx = 0;
+  if (headerIdx !== -1) {
+    for (let i = headerIdx + 1; i < entries.length; i++) {
+      if (isStop(entries[i].text)) {
+        startIdx = i;
+        break;
+      }
+    }
+  }
+
+  for (let i = startIdx; i < entries.length; i++) {
+    const entry = entries[i];
     const compact = normalizeTotalsLine(entry.text);
+    if (compact.includes("תנאיהסכם") || compact.includes("תנאים/הסכם")) break;
     const groups = numericGroups(entry.page);
+    if (!groups.length) continue;
+
     if ((compact.includes('סה"כ') || compact.includes("סךהכול")) && compact.includes("הנחה") && !compact.includes("מחירלפני")) {
-      if (groups[0] != null) subtotal = groups[0];
+      subtotal = Math.abs(groups[0]);
     } else if (compact.includes("הנחה") && !compact.includes("לפני") && compact.includes("%")) {
       discountType = "percent";
       if (groups.length >= 2) {
-        discountAmount = groups[0] ?? 0;
-        discountValue = groups[1] ?? 0;
+        const a = Math.abs(groups[0] ?? 0);
+        const b = Math.abs(groups[1] ?? 0);
+        if (subtotal != null && subtotal > 0) {
+          const errAB = Math.abs(subtotal * (b / 100) - a);
+          const errBA = Math.abs(subtotal * (a / 100) - b);
+          if (errBA + 0.01 < errAB) {
+            discountAmount = b;
+            discountValue = a;
+          } else {
+            discountAmount = a;
+            discountValue = b;
+          }
+        } else {
+          discountAmount = a;
+          discountValue = b;
+        }
       } else {
-        discountValue = groups[0] ?? 0;
+        discountValue = Math.abs(groups[0] ?? 0);
         discountAmount = 0;
       }
     } else if (compact.includes("הנחה") && !compact.includes("לפני")) {
       discountType = "amount";
-      discountValue = groups[0] ?? 0;
-      discountAmount = groups[0] ?? 0;
+      discountValue = Math.abs(groups[0] ?? 0);
+      discountAmount = discountValue;
     } else if (compact.includes("מחיר") && compact.includes("לפני") && compact.includes("מע")) {
-      if (groups[0] != null) totalBeforeVat = groups[0];
+      totalBeforeVat = Math.abs(groups[0]);
     } else if (compact.includes('מע"מ') && compact.includes("%")) {
-      vatRate = groups[groups.length - 1] ?? 18;
-      vatAmount = groups.length >= 2 ? groups[groups.length - 2] : null;
-      grandTotal = groups[0] ?? null;
-    } else if (compact.includes("מחירכולל")) {
-      if (groups[0] != null) grandTotal = groups[0];
+      vatRate = Math.abs(groups[groups.length - 1] ?? 18);
+      if (groups.length >= 2) vatAmount = Math.abs(groups[groups.length - 2]);
+      if (groups.length >= 3 || compact.includes("מחירכולל")) {
+        grandTotal = Math.abs(groups[0]);
+      }
+    } else if (compact.includes("מחירכולל") || compact.includes('סה"כלתשלום')) {
+      grandTotal = Math.abs(groups[0]);
     }
   }
 
@@ -794,7 +855,6 @@ export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
       `סכום הפריטים (${itemsSubtotal.toLocaleString("he-IL")}) אינו תואם לסה"כ המודפס (${printed.subtotal.toLocaleString("he-IL")})`,
     );
   }
-
   let discountType = printed.discountType;
   let discountValue = printed.discountValue;
   let discountAmount = printed.discountAmount;
@@ -802,7 +862,6 @@ export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
   if (discountType === "percent" && discountValue > 0 && discountAmount === 0) {
     discountAmount = round2(subtotal * (discountValue / 100));
   } else if (discountType === "percent" && discountValue > 0 && discountAmount > 0) {
-    // אם האחוז המודפס מעוגל (כמו 20.28%) והסכום השקלי מדויק (26,450), נשמור כהנחת סכום לדיוק מלא
     const expectedFromPercent = round2(subtotal * (discountValue / 100));
     if (Math.abs(expectedFromPercent - discountAmount) > 0.05) {
       discountType = "amount";
