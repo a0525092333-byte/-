@@ -273,8 +273,11 @@ function numericGroups(line: ExtractedLine): number[] {
     if (last) {
       const prev = last[last.length - 1];
       const joinedLast = last.map((item) => item.text).join("").trim();
+      const gap = run.x - (prev.x + prev.width);
+      const startsWithPunct = /^[,.]/.test(run.text.trim());
+      const endsWithPunct = /[,.-]$/.test(joinedLast);
       const endsWithCents = /\.\d{2}$/.test(joinedLast);
-      if (!endsWithCents && run.x - (prev.x + prev.width) < 12) {
+      if ((startsWithPunct && gap < 45) || (endsWithPunct && gap < 25) || (!endsWithCents && gap < 25)) {
         last.push(run);
         continue;
       }
@@ -696,9 +699,13 @@ function normalizeTotalsLine(text: string): string {
     .replace(/[״"]/g, '"')
     .replace(/[׳']/g, "'")
     .replace(/[:：]/g, "")
-    .replace(/לפנהינחה/g, "לפניהנחה")
+    .replace(/כ"הס/g, 'סה"כ')
+    .replace(/ללוכ/g, "כולל")
+    .replace(/ריחמ/g, "מחיר")
+    .replace(/מ"עמ/g, 'מע"מ')
+    .replace(/לפנהינחה|נהינהח|ניהנהח|ניהנחה|נהינחה/g, "לפניהנחה")
     .replace(/חהנה|החנה|הנהח|נהחה/g, "הנחה")
-    .replace(/ינלפ|ינפל/g, "לפני");
+    .replace(/ינלפ|ינפל|לפנ(?=[מה])/g, "לפני");
 }
 
 function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
@@ -743,14 +750,15 @@ function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
     if (compact.includes("תנאיהסכם") || compact.includes("תנאים/הסכם")) break;
     const groups = numericGroups(entry.page);
     if (!groups.length) continue;
+    const pos = groups.map((n) => Math.abs(n)).filter((n) => n > 0);
 
     if ((compact.includes('סה"כ') || compact.includes("סךהכול")) && compact.includes("הנחה") && !compact.includes("מחירלפני")) {
       subtotal = Math.abs(groups[0]);
     } else if (compact.includes("הנחה") && !compact.includes("לפני") && compact.includes("%")) {
       discountType = "percent";
-      if (groups.length >= 2) {
-        const a = Math.abs(groups[0] ?? 0);
-        const b = Math.abs(groups[1] ?? 0);
+      if (pos.length >= 2) {
+        const a = pos[0];
+        const b = pos[1];
         if (subtotal != null && subtotal > 0) {
           const errAB = Math.abs(subtotal * (b / 100) - a);
           const errBA = Math.abs(subtotal * (a / 100) - b);
@@ -765,23 +773,32 @@ function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
           discountAmount = a;
           discountValue = b;
         }
+      } else if (pos.length === 1) {
+        if (pos[0] > 100 && (subtotal == null || subtotal <= 0 || pos[0] <= subtotal)) {
+          discountType = "amount";
+          discountValue = pos[0];
+          discountAmount = pos[0];
+        } else {
+          discountValue = pos[0];
+          discountAmount = 0;
+        }
       } else {
-        discountValue = Math.abs(groups[0] ?? 0);
+        discountValue = 0;
         discountAmount = 0;
       }
     } else if (compact.includes("הנחה") && !compact.includes("לפני")) {
       discountType = "amount";
-      discountValue = Math.abs(groups[0] ?? 0);
+      discountValue = pos[0] ?? 0;
       discountAmount = discountValue;
-    } else if (compact.includes("מחיר") && compact.includes("לפני") && compact.includes("מע")) {
+    } else if (compact.includes("מחיר") && (compact.includes("לפני") || compact.includes("פל")) && compact.includes("מע") && !compact.includes("כולל")) {
       totalBeforeVat = Math.abs(groups[0]);
     } else if (compact.includes('מע"מ') && compact.includes("%")) {
       vatRate = Math.abs(groups[groups.length - 1] ?? 18);
       if (groups.length >= 2) vatAmount = Math.abs(groups[groups.length - 2]);
-      if (groups.length >= 3 || compact.includes("מחירכולל")) {
+      if (groups.length >= 3 || compact.includes("כולל")) {
         grandTotal = Math.abs(groups[0]);
       }
-    } else if (compact.includes("מחירכולל") || compact.includes('סה"כלתשלום')) {
+    } else if (compact.includes("מחירכולל") || compact.includes('מע"מכוללמחיר') || compact.includes('סה"כלתשלום')) {
       grandTotal = Math.abs(groups[0]);
     }
   }
@@ -867,6 +884,9 @@ export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
       discountType = "amount";
       discountValue = discountAmount;
     }
+  } else if (discountValue === 0 && discountAmount > 0) {
+    discountType = "amount";
+    discountValue = discountAmount;
   }
 
   const inferredBeforeVat =
@@ -875,7 +895,7 @@ export function parseQuoteDocument(pages: ExtractedLine[]): ParsedQuote {
       ? round2(printed.grandTotal - printed.vatAmount)
       : null);
 
-  if (discountValue === 0 && discountAmount === 0 && inferredBeforeVat != null && subtotal - inferredBeforeVat > 1) {
+  if (discountValue === 0 && inferredBeforeVat != null && subtotal - inferredBeforeVat > 1) {
     discountAmount = round2(subtotal - inferredBeforeVat);
     discountType = "amount";
     discountValue = discountAmount;
