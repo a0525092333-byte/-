@@ -3285,7 +3285,7 @@ async function deleteEventRoute({ headers, env, db, id }) {
   return { status: 200, body: { ok: true } };
 }
 
-function neonAuthBase(env) {function cleanEnvUrl(value) {
+function cleanEnvUrl(value) {
   return String(value || "")
     .replace(/\s+/g, "")
     .replace(/^["']+|["']+$/g, "")
@@ -3346,6 +3346,9 @@ async function authProxyRoute({ method, path, headers, rawBody, env }) {
     authOrigin,
     incomingOrigin,
   ].filter((v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx);
+  if (method === "GET" || method === "HEAD") {
+    candidateOrigins.push("");
+  }
 
   try {
     let res = null;
@@ -3354,8 +3357,11 @@ async function authProxyRoute({ method, path, headers, rawBody, env }) {
       const forward = {
         "content-type": headers["content-type"] || headers["Content-Type"] || "application/json",
         accept: headers.accept || headers.Accept || "application/json",
-        origin: candidateOrigin,
       };
+      if (candidateOrigin) {
+        forward.origin = candidateOrigin;
+        forward.referer = `${candidateOrigin}/`;
+      }
       if (cookie) forward.cookie = cookie;
       res = await fetch(target, {
         method,
@@ -3370,7 +3376,11 @@ async function authProxyRoute({ method, path, headers, rawBody, env }) {
       if (!originRejected) break;
     }
     const outHeaders = {};
-    const rawCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    let rawCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    if (!rawCookies.length) {
+      const single = res.headers.get("set-cookie");
+      if (single) rawCookies = [single];
+    }
     const setCookie = rawCookies.map(normalizeAuthCookie);
     if (setCookie.length === 1) outHeaders["set-cookie"] = setCookie[0];
     else if (setCookie.length > 1) outHeaders["set-cookie"] = setCookie;
