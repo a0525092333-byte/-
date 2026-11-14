@@ -2020,18 +2020,18 @@ async function resetUserPasswordRoute({ headers, env, db, body }) {
   try {
     hash = await hashPassword(password);
     if (!(await verifyPassword(password, hash))) {
-      console.error("[password-reset] hash self-verification failed");
+      console.error("[] hash self-verification failed");
       return { status: 500, body: { ok: false, error: "hash_failed", message: "איפוס הסיסמה נכשל — הסיסמה לא נשמרה. נסה שוב." } };
     }
   } catch (e) {
-    console.error("[password-reset] hash failed", e?.message || e);
+    console.error("[] hash failed", e?.message || e);
     return { status: 500, body: { ok: false, error: "hash_failed", message: "איפוס הסיסמה נכשל — נסה שוב." } };
   }
   let written = { ok: false, previousHash: null };
   try {
     written = await writeAccountPassword(db, target.id, hash);
   } catch (e) {
-    console.error("[password-reset] account write failed", e?.message || e);
+    console.error("[] account write failed", e?.message || e);
     return { status: 500, body: { ok: false, error: "write_failed", message: "לא הצלחנו לעדכן את הסיסמה בשרת ההתחברות" } };
   }
   if (!written.ok) {
@@ -2040,7 +2040,7 @@ async function resetUserPasswordRoute({ headers, env, db, body }) {
   try {
     await db.query(`UPDATE public.profiles SET must_change_password = true WHERE id = $1`, [target.id]);
   } catch (e) {
-    console.error("[password-reset] flag update failed", e?.message || e);
+    console.error("[] flag update failed", e?.message || e);
   }
   return {
     status: 200,
@@ -2220,7 +2220,7 @@ async function sendPasswordEmailRoute({ headers, env, db, body }) {
     }
     if (!res.ok) {
       const reason = String(data?.message || data?.error || `HTTP ${res.status}`).slice(0, 300);
-      console.error("[password-reset] email failed", res.status, reason);
+      console.error("[] email failed", res.status, reason);
       return {
         status: 503,
         body: { ok: false, error: "send_failed", message: `שליחת המייל נכשלה: ${reason}` },
@@ -2228,7 +2228,7 @@ async function sendPasswordEmailRoute({ headers, env, db, body }) {
     }
     return { status: 200, body: { ok: true } };
   } catch (e) {
-    console.error("[password-reset] email error", e?.message || e);
+    console.error("[] email error", e?.message || e);
     return {
       status: 503,
       body: { ok: false, error: "send_failed", message: "שליחת המייל נכשלה — מסור את הסיסמה ידנית" },
@@ -3285,12 +3285,19 @@ async function deleteEventRoute({ headers, env, db, id }) {
   return { status: 200, body: { ok: true } };
 }
 
+function neonAuthBase(env) {function cleanEnvUrl(value) {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/^["']+|["']+$/g, "")
+    .replace(/\/+$/, "");
+}
+
 function neonAuthBase(env) {
-  const explicit = String(env.NEON_AUTH_URL || env.VITE_NEON_AUTH_URL || "").trim().replace(/\/+$/, "");
+  const explicit = cleanEnvUrl(env.NEON_AUTH_URL || env.VITE_NEON_AUTH_URL);
   if (explicit && !explicit.includes("ep-xxx")) return explicit;
-  const data = String(env.NEON_DATA_API_URL || env.VITE_NEON_DATA_API_URL || "").trim();
+  const data = cleanEnvUrl(env.NEON_DATA_API_URL || env.VITE_NEON_DATA_API_URL);
   const match = data.match(/^https:\/\/([^.]+)\.apirest\.([^/]+)\/([^/]+)\/rest\/v1\/?$/);
-  if (match) return `https://${match[1]}.neonauth.${match[2]}/${match[3]}/auth`;
+  if (match && !match[1].includes("ep-xxx")) return `https://${match[1]}.neonauth.${match[2]}/${match[3]}/auth`;
   return null;
 }
 
@@ -3303,6 +3310,19 @@ const AUTH_PROXY_PATHS = new Set([
   "/api/auth/token/anonymous",
 ]);
 
+function normalizeAuthCookie(cookieStr) {
+  let out = String(cookieStr || "")
+    .replace(/;\s*Domain=[^;]*/gi, "")
+    .replace(/;\s*Partitioned/gi, "")
+    .replace(/;\s*SameSite=None/gi, "; SameSite=Lax");
+  if (/;\s*Path=/i.test(out)) {
+    out = out.replace(/;\s*Path=[^;]*/gi, "; Path=/");
+  } else {
+    out += "; Path=/";
+  }
+  return out;
+}
+
 async function authProxyRoute({ method, path, headers, rawBody, env }) {
   if (!AUTH_PROXY_PATHS.has(path)) {
     return { status: 404, body: { ok: false, error: "not_found" } };
@@ -3312,24 +3332,46 @@ async function authProxyRoute({ method, path, headers, rawBody, env }) {
     return { status: 503, body: { ok: false, error: "auth_unavailable", message: "שירות ההתחברות אינו זמין כרגע — נסה שוב" } };
   }
   const target = `${base}${path.slice("/api/auth".length)}`;
-  const forward = {
-    "content-type": headers["content-type"] || headers["Content-Type"] || "application/json",
-    accept: headers.accept || headers.Accept || "application/json",
-  };
-  const origin = headers.origin || headers.Origin;
-  if (origin) forward.origin = origin;
   const cookie = headers.cookie || headers.Cookie;
-  if (cookie) forward.cookie = cookie;
+  const incomingOrigin = headers.origin || headers.Origin;
+  let authOrigin = null;
   try {
-    const res = await fetch(target, {
-      method,
-      headers: forward,
-      body: method === "GET" || method === "HEAD" ? undefined : rawBody,
-      redirect: "manual",
-    });
-    const text = await res.text();
+    authOrigin = new URL(base).origin;
+  } catch {
+    authOrigin = null;
+  }
+  const candidateOrigins = [
+    cleanEnvUrl(env.NEON_AUTH_TRUSTED_ORIGIN),
+    "https://website-habmqkuh.vincen.space",
+    authOrigin,
+    incomingOrigin,
+  ].filter((v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx);
+
+  try {
+    let res = null;
+    let text = "";
+    for (const candidateOrigin of candidateOrigins) {
+      const forward = {
+        "content-type": headers["content-type"] || headers["Content-Type"] || "application/json",
+        accept: headers.accept || headers.Accept || "application/json",
+        origin: candidateOrigin,
+      };
+      if (cookie) forward.cookie = cookie;
+      res = await fetch(target, {
+        method,
+        headers: forward,
+        body: method === "GET" || method === "HEAD" ? undefined : rawBody,
+        redirect: "manual",
+      });
+      text = await res.text();
+      const originRejected =
+        res.status === 403 ||
+        (res.status === 400 && /origin|csrf|trusted/i.test(text));
+      if (!originRejected) break;
+    }
     const outHeaders = {};
-    const setCookie = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    const rawCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    const setCookie = rawCookies.map(normalizeAuthCookie);
     if (setCookie.length === 1) outHeaders["set-cookie"] = setCookie[0];
     else if (setCookie.length > 1) outHeaders["set-cookie"] = setCookie;
     const contentType = res.headers.get("content-type");
