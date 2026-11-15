@@ -1,4 +1,4 @@
-eAxport const passwordResetContent = {
+export const passwordResetContent = {
   button: "איפוס סיסמה",
   title: "איפוס סיסמה",
   description: (name: string, email: string) => `קביעת סיסמה זמנית חדשה עבור ${name} (${email}).`,
