@@ -73,7 +73,10 @@ function coalesceRuns(runs: ExtractedRun[]): ExtractedRun[] {
     const prev = out[out.length - 1];
     if (prev) {
       const gap = prev.x - (run.x + run.width);
-      if (gap < 6) {
+      const separateColumns =
+        (prev.text.includes("מחיר") && run.text.includes("כמות")) ||
+        (prev.text.includes("פריט") && run.text.includes("מחיר"));
+      if (gap < 6 && !separateColumns) {
         const right = prev.x + prev.width;
         prev.text = normalizeGershayim(prev.text + run.text);
         prev.x = run.x;
@@ -205,7 +208,9 @@ function fixPunctuationSpacing(value: string): string {
 }
 
 function fixHebrewDigitSpacing(value: string): string {
-  return value.replace(/([\u0590-\u05FF])(\d)/g, "$1 $2");
+  return value
+    .replace(/([\u05D0-\u05EA])([A-Za-z0-9])/g, "$1 $2")
+    .replace(/([A-Za-z0-9])([\u05D0-\u05EA])/g, "$1 $2");
 }
 
 function stripBullets(value: string): string {
@@ -488,6 +493,7 @@ function isHeader(line: string): boolean {
 }
 
 function isStop(line: string): boolean {
+  if (isTableHeader(line)) return false;
   const compact = line.replace(/\s+/g, "");
   return (
     STOP_KEYWORDS.some((keyword) => line.startsWith(keyword)) ||
@@ -628,12 +634,38 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
   }
   if (headerIndex === -1) return { items, sections };
   const swapDimensions = entries[headerIndex].text.includes("#");
+  let currentPage = entries[headerIndex].page.page;
 
   for (let i = headerIndex + 1; i < entries.length; i++) {
     const entry = entries[i];
     const text = entry.text;
-    if (isStop(text) || /^תאריך/.test(text) || /^חתימה/.test(text)) break;
-    if (isTableHeader(text)) continue;
+    if (isTableHeader(text)) {
+      columns = headerColumns(entry.page);
+      currentPage = entry.page.page ?? currentPage;
+      continue;
+    }
+    if (isStop(text)) break;
+
+    const isFooter = /^תאריך/.test(text) || /^חתימה/.test(text);
+    const isNewPage = entry.page.page != null && currentPage != null && entry.page.page > currentPage;
+    if (isFooter || isNewPage) {
+      let nextHeader = -1;
+      for (let k = i; k < entries.length; k++) {
+        if (isTableHeader(entries[k].text)) {
+          nextHeader = k;
+          break;
+        }
+        if (isStop(entries[k].text)) break;
+      }
+      if (nextHeader !== -1) {
+        columns = headerColumns(entries[nextHeader].page);
+        currentPage = entries[nextHeader].page.page ?? currentPage;
+        i = nextHeader;
+        continue;
+      }
+      if (isFooter) break;
+      currentPage = entry.page.page;
+    }
 
     const cells = rowCells(entry.page, columns);
     const nameText = stripBullets(cells.name);
@@ -687,7 +719,7 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
     if (swapDimensions) {
       item.name = item.name.replace(/(\d+(?:\.\d+)?)\*(\d+(?:\.\d+)?)/, (_, a, b) => `${b}*${a}`);
     }
-    if (item.description) item.description = fixBrackets(fixPunctuationSpacing(item.description));
+    if (item.description) item.description = fixBrackets(fixPunctuationSpacing(fixHebrewDigitSpacing(item.description)));
   }
 
   return { items, sections };
@@ -746,6 +778,7 @@ function parseTotals(entries: { page: ExtractedLine; text: string }[]): {
 
   for (let i = startIdx; i < entries.length; i++) {
     const entry = entries[i];
+    if (isTableHeader(entry.text)) continue;
     const compact = normalizeTotalsLine(entry.text);
     if (compact.includes("תנאיהסכם") || compact.includes("תנאים/הסכם")) break;
     const groups = numericGroups(entry.page);
