@@ -25,14 +25,21 @@ for (const envFile of [".env.local", ".env"]) {
   }
 }
 
-process.env.NEON_DATA_API_URL = process.env.NEON_DATA_API_URL || process.env.VITE_NEON_DATA_API_URL || "";
+process.env.NEON_DATA_API_URL = (
+  process.env.NEON_DATA_API_URL ||
+  process.env.VITE_NEON_DATA_API_URL ||
+  ""
+)
+  .trim()
+  .replace(/^['"]|['"]$/g, "")
+  .replace(/\/+$/, "");
 
 for (const oid of [1082, 1083, 1114, 1184]) {
   pg.types.setTypeParser(oid, (val) => val);
 }
 
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: (process.env.DATABASE_URL || "").trim().replace(/^['"]|['"]$/g, ""),
   ssl: { rejectUnauthorized: false },
 });
 
@@ -64,16 +71,31 @@ const db = {
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".cjs": "application/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".wasm": "application/wasm",
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
   ".webp": "image/webp",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
+  ".woff": "font/woff",
   ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".pdf": "application/pdf",
 };
+
+function safeDecode(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const proto = req.headers["x-forwarded-proto"] || "http";
@@ -81,34 +103,59 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `${proto}://${host}`);
 
   if (url.pathname.startsWith("/api/")) {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const rawBody = Buffer.concat(chunks);
-    const json = () => (rawBody.length ? JSON.parse(rawBody.toString("utf8")) : {});
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const rawBody = Buffer.concat(chunks);
+      const json = () => (rawBody.length ? JSON.parse(rawBody.toString("utf8")) : {});
 
-    const result = await handler({
-      method: req.method || "GET",
-      path: url.pathname,
-      url,
-      headers: req.headers,
-      rawBody,
-      json,
-      env: process.env,
-      db,
-    });
+      const result = await handler({
+        method: req.method || "GET",
+        path: url.pathname,
+        url,
+        headers: req.headers,
+        rawBody,
+        json,
+        env: process.env,
+        db,
+      });
 
-    const outHeaders = { ...(result.headers || {}) };
-    const isRaw = typeof result.body === "string" || Buffer.isBuffer(result.body);
-    if (!outHeaders["content-type"] && !outHeaders["Content-Type"]) {
-      outHeaders["content-type"] = "application/json; charset=utf-8";
+      const outHeaders = { ...(result.headers || {}) };
+      const isRaw = typeof result.body === "string" || Buffer.isBuffer(result.body);
+      if (!outHeaders["content-type"] && !outHeaders["Content-Type"]) {
+        outHeaders["content-type"] = "application/json; charset=utf-8";
+      }
+      res.writeHead(result.status || 200, outHeaders);
+      res.end(isRaw ? result.body : JSON.stringify(result.body ?? {}));
+    } catch (err) {
+      console.error("[server] /api error:", err?.message || err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, error: "server_error", message: "שגיאת שרת פנימית" }));
+      }
     }
-    res.writeHead(result.status || 200, outHeaders);
-    res.end(isRaw ? result.body : JSON.stringify(result.body ?? {}));
     return;
   }
 
-  let filePath = path.join(distDir, url.pathname === "/" ? "index.html" : url.pathname);
+  let reqPath = safeDecode(url.pathname === "/" ? "/index.html" : url.pathname);
+  const assetsIdx = reqPath.indexOf("/assets/");
+  if (assetsIdx > 0) {
+    reqPath = reqPath.slice(assetsIdx);
+  }
+  const brandIdx = reqPath.indexOf("/brand/");
+  if (brandIdx > 0) {
+    reqPath = reqPath.slice(brandIdx);
+  }
+
+  let filePath = path.join(distDir, reqPath);
+  const isAssetRequest = reqPath.startsWith("/assets/");
+
   if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    if (isAssetRequest) {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Asset not found");
+      return;
+    }
     filePath = path.join(distDir, "index.html");
   }
   if (!fs.existsSync(filePath)) {
