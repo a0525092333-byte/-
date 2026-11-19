@@ -510,7 +510,7 @@ type ColumnKey = "index" | "name" | "unit_price" | "qty" | "total";
 const COLUMN_KEYWORDS: Record<ColumnKey, string[]> = {
   index: ["#", "מס׳", "מס'"],
   name: ["שם הפריט", "פריט"],
-  unit_price: ["מחיר ליחידה", "מחיר יח'", "מחיר"],
+  unit_price: ["מחיר ליחידה","מחיר יח", "מחיר יח'", "מחיר"],
   qty: ["כמות"],
   total: ['מחיר לפני מע"מ', "סכום", 'סה"כ', "סה״כ"],
 };
