@@ -612,8 +612,18 @@ function parseItemRow(
 }
 
 function isTableHeader(text: string): boolean {
-  return text.includes("פריט") && text.includes("כמות") && text.includes("מחיר");
+        const normalized = text.replace(/\s+/g, " ").trim();
+        const hasItemCol = normalized.includes("פריט") || normalized.includes("שם הפריט");
+        const hasQtyCol = normalized.includes("כמות");
+        const hasPriceCol =
+                normalized.includes("מחיר") ||
+                normalized.includes("מחיר יח") ||
+                normalized.includes("מחיר לפני מע") ||
+                normalized.includes('סה"כ');
+        const matchesCount = [hasItemCol, hasQtyCol, hasPriceCol].filter(Boolean).length;
+        return hasItemCol && matchesCount >= 2;
 }
+
 
 function parseItems(entries: { page: ExtractedLine; text: string }[]): {
   items: ParsedItem[];
