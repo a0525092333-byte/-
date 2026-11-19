@@ -646,27 +646,16 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
     }
     if (isStop(text)) break;
 
-    const isFooter = /^תאריך/.test(text) || /^חתימה/.test(text);
+    const isFooter = /^המשך/.test(text) || /^תחתית/.test(text);
     const isNewPage = entry.page.page != null && currentPage != null && entry.page.page > currentPage;
-    if (isFooter || isNewPage) {
-      let nextHeader = -1;
-      for (let k = i; k < entries.length; k++) {
-        if (isTableHeader(entries[k].text)) {
-          nextHeader = k;
-          break;
-        }
-        if (isStop(entries[k].text)) break;
-      }
-      if (nextHeader !== -1) {
-        columns = headerColumns(entries[nextHeader].page);
-        currentPage = entries[nextHeader].page.page ?? currentPage;
-        i = nextHeader;
-        continue;
-      }
-      if (isFooter) break;
+
+    if (isNewPage) {
       currentPage = entry.page.page;
     }
 
+    if (isFooter) {
+      continue;
+    }
     const cells = rowCells(entry.page, columns);
     const nameText = stripBullets(cells.name);
     const hasNumbers = /\d/.test(cells.unitPriceText + cells.qtyText + cells.totalText);
