@@ -625,23 +625,23 @@ function parseItems(entries: { page: ExtractedLine; text: string }[]): {
   let headerIndex = -1;
   let columns: Partial<Record<ColumnKey, ColumnRange>> = {};
 
-  for (let i = 0; i < entries.length; i++) {
-    if (isTableHeader(entries[i].text)) {
-      headerIndex = i;
-      columns = headerColumns(entries[i].page);
-      break;
-    }
-  }
-  if (headerIndex === -1) return { items, sections };
-  const swapDimensions = entries[headerIndex].text.includes("#");
-  let currentPage = entries[headerIndex].page.page;
+  let swapDimensions = false;
+  let currentPage: number | null = null;
 
-  for (let i = headerIndex + 1; i < entries.length; i++) {
+  for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     const text = entry.text;
+
     if (isTableHeader(text)) {
       columns = headerColumns(entry.page);
+      if (text.includes("#")) {
+        swapDimensions = true;
+      }
       currentPage = entry.page.page ?? currentPage;
+      continue;
+    }
+
+    if (!Object.keys(columns).length) {
       continue;
     }
     if (isStop(text)) break;
