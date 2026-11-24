@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, KeyRound, PlugZap } from "lucide-react";
+import { CheckCircle2, KeyRound, Mail, PlugZap, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { useCompanySettings } from "@/hooks/use-data";
 import { db } from "@/integrations/neon/client";
@@ -9,6 +9,13 @@ import { Input } from "@/components/ui/input";
 import { Field, Select, Textarea } from "@/components/ui/controls";
 import { SectionCard } from "@/components/shared";
 import { DEFAULT_TERMS } from "@/lib/quotes";
+import {
+  EMAIL_REGEX,
+  fetchQuoteCcEmails,
+  parseEmailInput,
+  saveQuoteCcEmails,
+  uniqueEmails,
+} from "@/lib/quote-email";
 import {
   fetchPaperlessStatus,
   probePaperlessConnection,
@@ -30,6 +37,11 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
   const [prefix, setPrefix] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [ccEmails, setCcEmails] = useState<string[]>([]);
+  const [newCcInput, setNewCcInput] = useState("");
+  const [ccBusy, setCcBusy] = useState(false);
+  const [ccError, setCcError] = useState<string | null>(null);
 
   const [pStatus, setPStatus] = useState<PaperlessStatusResponse | null>(null);
   const [pEnv, setPEnv] = useState<"production" | "sandbox">("production");
@@ -61,6 +73,10 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
   }, [settingsQ.data]);
 
   useEffect(() => {
+    fetchQuoteCcEmails().then((list) => setCcEmails(list));
+  }, []);
+
+  useEffect(() => {
     if (!canEdit) return;
     fetchPaperlessStatus()
       .then((res) => {
@@ -72,14 +88,67 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
       .catch(() => {});
   }, [canEdit]);
 
+  async function handleAddCc() {
+    if (!canEdit) return;
+    setCcError(null);
+    const parsed = parseEmailInput(newCcInput);
+    if (!parsed.length) return;
+    const invalid = parsed.find((addr) => !EMAIL_REGEX.test(addr));
+    if (invalid) {
+      setCcError(`כתובת אימייל לא תקינה: ${invalid}`);
+      return;
+    }
+    const next = uniqueEmails([...ccEmails, ...parsed]);
+    setCcBusy(true);
+    const saved = await saveQuoteCcEmails(next);
+    setCcBusy(false);
+    if (!saved.ok) {
+      setCcError(saved.message);
+      toast.error(saved.message);
+      return;
+    }
+    setCcEmails(saved.emails);
+    setNewCcInput("");
+    toast.success("נמען קבוע נוסף לרשימת העותקים (CC)");
+  }
+
+  async function handleRemoveCc(target: string) {
+    if (!canEdit) return;
+    setCcError(null);
+    const next = ccEmails.filter((item) => item !== target);
+    setCcBusy(true);
+    const saved = await saveQuoteCcEmails(next);
+    setCcBusy(false);
+    if (!saved.ok) {
+      setCcError(saved.message);
+      toast.error(saved.message);
+      return;
+    }
+    setCcEmails(saved.emails);
+    toast.success("הנמען הוסר מרשימת העותקים הקבועים");
+  }
+
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!canEdit) return;
     setError(null);
+    setCcError(null);
     if (!companyName.trim()) {
       setError("נא להזין שם חברה.");
       return;
     }
+
+    let nextCcList = ccEmails;
+    if (newCcInput.trim()) {
+      const pending = parseEmailInput(newCcInput);
+      const invalid = pending.find((addr) => !EMAIL_REGEX.test(addr));
+      if (invalid) {
+        setCcError(`כתובת אימייל לא תקינה: ${invalid}`);
+        return;
+      }
+      nextCcList = uniqueEmails([...ccEmails, ...pending]);
+    }
+
     setBusy(true);
     const payload = {
       id: 1,
@@ -95,13 +164,22 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
       default_notes: notes.trim() || null,
       quote_number_prefix: prefix.trim(),
     };
-    const { error: dbError } = await db.from("company_settings").upsert(payload);
+    const [{ error: dbError }, ccRes] = await Promise.all([
+      db.from("company_settings").upsert(payload),
+      saveQuoteCcEmails(nextCcList),
+    ]);
     setBusy(false);
     if (dbError) {
       setError("לא הצלחנו לשמור את פרטי החברה. נסה שוב.");
       return;
     }
-    toast.success("פרטי החברה עודכנו");
+    if (!ccRes.ok) {
+      setError(ccRes.message);
+      return;
+    }
+    setCcEmails(ccRes.emails);
+    setNewCcInput("");
+    toast.success("פרטי החברה והנמענים הקבועים עודכנו");
     settingsQ.refetch();
   }
 
@@ -162,7 +240,7 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
 
   return (
     <div className="space-y-5">
-      <SectionCard title="פרטי החברה להצעת מחיר" description="הפרטים שיודפסו בכותרת ההצעה">
+      <SectionCard title="פרטי החברה להצעת מחיר" description="הפרטים שיודפסו בכותרת ההצעה והגדרות שליחה במייל">
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="שם החברה" htmlFor="company-name">
@@ -187,6 +265,84 @@ export function CompanyQuoteSettings({ canEdit }: { canEdit: boolean }) {
               <Input id="company-prefix" value={prefix} onChange={(e) => setPrefix(e.target.value)} disabled={!canEdit} placeholder="לדוגמה: Q-" className="h-11" />
             </Field>
           </div>
+
+          <div className="rounded-xl border border-border bg-muted/25 p-4 space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-foreground">
+                נמענים קבועים בעותק גלוי (CC) בשליחת הצעה במייל
+              </p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                יופיעו מסומנים מראש ב-✓ בחלון &quot;שליחת הצעה ללקוח&quot; ויהיו גלויים ללקוח (כדי ש&quot;השב לכולם&quot; יגיע לכולם).
+              </p>
+            </div>
+
+            {ccEmails.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {ccEmails.map((addr) => (
+                  <span
+                    key={addr}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1 text-xs font-medium text-foreground shadow-xs"
+                  >
+                    <Mail className="size-3.5 text-muted-foreground shrink-0" />
+                    <span dir="ltr">{addr}</span>
+                    {canEdit ? (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveCc(addr)}
+                        disabled={ccBusy}
+                        title="הסר נמען קבוע"
+                        className="rounded-full p-0.5 text-muted-foreground hover:bg-red-50 hover:text-red-600 transition-colors"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    ) : null}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">טרם הוגדרו נמענים קבועים לעותק (CC).</p>
+            )}
+
+            {canEdit ? (
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Input
+                  id="company-quote-cc"
+                  type="text"
+                  inputMode="email"
+                  dir="ltr"
+                  value={newCcInput}
+                  onChange={(e) => {
+                    setNewCcInput(e.target.value);
+                    if (ccError) setCcError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddCc();
+                    }
+                  }}
+                  disabled={ccBusy}
+                  placeholder="office@example.com (ניתן להדביק מספר כתובות מופרדות בפסיק)"
+                  className="h-10 text-start flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleAddCc}
+                  disabled={ccBusy || !newCcInput.trim()}
+                >
+                  <Plus className="size-4" /> {ccBusy ? "שומר…" : "הוסף נמען קבוע"}
+                </Button>
+              </div>
+            ) : null}
+
+            {ccError ? (
+              <p role="alert" className="text-xs font-medium text-red-600">
+                {ccError}
+              </p>
+            ) : null}
+          </div>
+
           <Field label="לוגו" htmlFor="company-logo">
             {canEdit ? (
               <ImageUpload value={logoUrl} onChange={setLogoUrl} label="העלאת לוגו" />
