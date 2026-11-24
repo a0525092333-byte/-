@@ -62,21 +62,77 @@ const db = {
 };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-let quoteCcColumnReady = false;
+let companySettingsSchemaState = null;
 
-async function ensureQuoteCcColumn(database) {
-  if (quoteCcColumnReady) return;
+async function ensureCompanySettingsReady(database) {
+  if (companySettingsSchemaState) return companySettingsSchemaState;
+
   await database.query(`
-    ALTER TABLE public.company_settings
-      ADD COLUMN IF NOT EXISTS quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[];
+    CREATE TABLE IF NOT EXISTS public.company_settings (
+      id integer PRIMARY KEY DEFAULT 1,
+      company_name text NOT NULL DEFAULT 'נס סגא לדים ומולטימדיה בע״מ',
+      logo_url text,
+      tax_id text,
+      address text,
+      phone text,
+      email text,
+      default_vat_rate numeric(5,2) NOT NULL DEFAULT 18,
+      default_terms jsonb NOT NULL DEFAULT '[]'::jsonb,
+      default_terms_text text,
+      default_notes text,
+      quote_number_prefix text NOT NULL DEFAULT '',
+      quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[],
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
-  try {
-    await database.query(`GRANT SELECT (quote_cc_emails) ON public.company_settings TO authenticated;`);
-    await database.query(`NOTIFY pgrst, 'reload schema';`);
-  } catch {
-    // Column grant is optional because settings are served via /api/quotes/cc-settings
+
+  await database.query(`
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS company_name text NOT NULL DEFAULT 'נס סגא לדים ומולטימדיה בע״מ';
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS logo_url text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS tax_id text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS address text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS phone text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS email text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_vat_rate numeric(5,2) NOT NULL DEFAULT 18;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_terms_text text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_notes text;
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS quote_number_prefix text NOT NULL DEFAULT '';
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[];
+    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+  `);
+
+  const colRows = await database.query(`
+    SELECT column_name, udt_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'company_settings'
+  `);
+
+  let termsUdt = colRows.find((r) => r.column_name === "default_terms")?.udt_name || null;
+  if (!termsUdt) {
+    await database.query(`
+      ALTER TABLE public.company_settings
+        ADD COLUMN IF NOT EXISTS default_terms jsonb NOT NULL DEFAULT '[]'::jsonb;
+    `);
+    termsUdt = "jsonb";
   }
-  quoteCcColumnReady = true;
+
+  try {
+    const safeCols = colRows
+      .map((r) => String(r.column_name))
+      .filter((c) => !["backup_drive_token", "paperless_api_key"].includes(c) && /^[a-z0-9_]+$/i.test(c));
+    if (!safeCols.includes("default_terms")) safeCols.push("default_terms");
+    if (safeCols.length > 0) {
+      await database.query(
+        `GRANT SELECT (${safeCols.map((c) => `"${c}"`).join(", ")}) ON public.company_settings TO authenticated;`,
+      );
+      await database.query(`NOTIFY pgrst, 'reload schema';`);
+    }
+  } catch {
+    // Non-fatal: reads and writes are served directly through /api/quotes/company-settings
+  }
+
+  companySettingsSchemaState = { termsUdt };
+  return companySettingsSchemaState;
 }
 
 function parseEmailCandidates(raw) {
@@ -106,6 +162,24 @@ function dedupeEmails(list, excludeEmail = null) {
     out.push(clean);
   }
   return out;
+}
+
+function normalizeTermsArray(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map((t) => String(t ?? "").trim()).filter(Boolean);
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((t) => String(t ?? "").trim()).filter(Boolean);
+      }
+    } catch {
+      // treat as newline-separated text
+    }
+    return raw.split(/\r?\n/).map((t) => t.trim()).filter(Boolean);
+  }
+  return [];
 }
 
 function userIdFromAuth(headers) {
@@ -181,7 +255,7 @@ async function verifyQuotesCaller(headers, env, action = "edit") {
       message: action === "edit" ? "אין לך הרשאה לערוך או לשלוח הצעות מחיר" : "אין לך הרשאה לצפות בהגדרות הצעות מחיר",
     };
   } catch (e) {
-    console.error("[quote-cc] auth check failed", e?.message || e);
+    console.error("[quote-settings] auth check failed", e?.message || e);
     return { ok: false, status: 503, error: "server", message: "שגיאה בבדיקת ההרשאות — נסה שוב" };
   }
 }
@@ -211,7 +285,7 @@ function emailShell({ heading, bodyHtml }) {
           ${bodyHtml}
         </td></tr>
         <tr><td style="padding:16px 24px;background:#f9fafb;border-top:1px solid #e5e7eb">
-          <p style="margin:0;color:#6b7280;font-size:11px">הודעה זו נשלחה ממערכת "נס מולטימדיה". אם לא ביקשת אותה, אפשר להתעלם.</p>
+          <p style="margin:0;font-size:11px;color:#6b7280">הודעה זו נשלחה ממערכת "נס מולטימדיה". אם לא ביקשת אותה, אפשר להתעלם.</p>
         </td></tr>
       </table>
     </td></tr>
@@ -240,13 +314,181 @@ function jpegDimensions(buffer) {
   return null;
 }
 
+async function handleCompanyQuoteSettings({ method, headers, env, database, json }) {
+  if (method === "GET") {
+    const caller = await verifyQuotesCaller(headers, env, "view");
+    if (!caller.ok) {
+      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
+    }
+    await ensureCompanySettingsReady(database);
+    const rows = await database.query(`
+      SELECT id, company_name, logo_url, tax_id, address, phone, email,
+             default_vat_rate, default_terms, default_terms_text, default_notes,
+             quote_number_prefix, quote_cc_emails, updated_at
+      FROM public.company_settings
+      WHERE id = 1
+      LIMIT 1
+    `);
+    const row = rows[0] || null;
+    return {
+      status: 200,
+      headers: { "Cache-Control": "no-store" },
+      body: {
+        ok: true,
+        settings: row
+          ? {
+              ...row,
+              default_vat_rate: Number(row.default_vat_rate ?? 18),
+              default_terms: normalizeTermsArray(row.default_terms),
+              quote_cc_emails: dedupeEmails(row.quote_cc_emails ?? []),
+            }
+          : null,
+      },
+    };
+  }
+
+  if (method === "POST") {
+    const caller = await verifyQuotesCaller(headers, env, "edit");
+    if (!caller.ok) {
+      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
+    }
+    const body = json();
+    const companyName = String(body?.company_name ?? "").trim();
+    if (!companyName) {
+      return { status: 400, body: { ok: false, error: "missing_name", message: "נא להזין שם חברה." } };
+    }
+
+    const logoUrl = body?.logo_url ? String(body.logo_url) : null;
+    const taxId = body?.tax_id ? String(body.tax_id).trim() || null : null;
+    const address = body?.address ? String(body.address).trim() || null : null;
+    const phone = body?.phone ? String(body.phone).trim() || null : null;
+    const email = body?.email ? String(body.email).trim() || null : null;
+    const vatNum = Number(body?.default_vat_rate);
+    const defaultVatRate = Number.isFinite(vatNum) && vatNum >= 0 ? vatNum : 18;
+    const defaultTerms = normalizeTermsArray(body?.default_terms);
+    const defaultTermsText = body?.default_terms_text ? String(body.default_terms_text).trim() || null : null;
+    const defaultNotes = body?.default_notes ? String(body.default_notes).trim() || null : null;
+    const quoteNumberPrefix = String(body?.quote_number_prefix ?? "").trim();
+
+    let hasCcUpdate = false;
+    let ccEmails = [];
+    if (body && Object.hasOwn(body, "quote_cc_emails") && body.quote_cc_emails !== undefined) {
+      hasCcUpdate = true;
+      const candidates = parseEmailCandidates(body.quote_cc_emails);
+      for (const candidate of candidates) {
+        if (!EMAIL_RE.test(candidate)) {
+          return {
+            status: 400,
+            body: { ok: false, error: "invalid_email", message: `כתובת אימייל לא תקינה: ${candidate}` },
+          };
+        }
+      }
+      ccEmails = dedupeEmails(candidates);
+      if (ccEmails.length > 20) {
+        return {
+          status: 400,
+          body: { ok: false, error: "too_many", message: "ניתן להגדיר עד 20 נמענים קבועים" },
+        };
+      }
+    }
+
+    const { termsUdt } = await ensureCompanySettingsReady(database);
+    const termsParam = termsUdt === "_text" ? defaultTerms : JSON.stringify(defaultTerms);
+    const termsCast =
+      termsUdt === "_text"
+        ? "::text[]"
+        : termsUdt === "jsonb"
+          ? "::jsonb"
+          : termsUdt === "json"
+            ? "::json"
+            : "::text";
+
+    const updateParams = [
+      companyName,
+      logoUrl,
+      taxId,
+      address,
+      phone,
+      email,
+      defaultVatRate,
+      termsParam,
+      defaultTermsText,
+      defaultNotes,
+      quoteNumberPrefix,
+    ];
+    if (hasCcUpdate) updateParams.push(ccEmails);
+
+    const updated = await database.query(
+      `UPDATE public.company_settings
+       SET company_name = $1,
+           logo_url = $2,
+           tax_id = $3,
+           address = $4,
+           phone = $5,
+           email = $6,
+           default_vat_rate = $7,
+           default_terms = $8${termsCast},
+           default_terms_text = $9,
+           default_notes = $10,
+           quote_number_prefix = $11,
+           ${hasCcUpdate ? "quote_cc_emails = $12::text[]," : ""}
+           updated_at = now()
+       WHERE id = 1
+       RETURNING id`,
+      updateParams,
+    );
+
+    if (!updated.length) {
+      await database.query(
+        `INSERT INTO public.company_settings (
+           id, company_name, logo_url, tax_id, address, phone, email,
+           default_vat_rate, default_terms, default_terms_text, default_notes,
+           quote_number_prefix, quote_cc_emails, updated_at
+         ) VALUES (
+           1, $1, $2, $3, $4, $5, $6,
+           $7, $8${termsCast}, $9, $10,
+           $11, $12::text[], now()
+         )`,
+        [
+          companyName,
+          logoUrl,
+          taxId,
+          address,
+          phone,
+          email,
+          defaultVatRate,
+          termsParam,
+          defaultTermsText,
+          defaultNotes,
+          quoteNumberPrefix,
+          hasCcUpdate ? ccEmails : [],
+        ],
+      );
+    }
+
+    const savedRows = await database.query(
+      `SELECT quote_cc_emails FROM public.company_settings WHERE id = 1 LIMIT 1`,
+    );
+    return {
+      status: 200,
+      headers: { "Cache-Control": "no-store" },
+      body: {
+        ok: true,
+        emails: dedupeEmails(savedRows[0]?.quote_cc_emails ?? []),
+      },
+    };
+  }
+
+  return { status: 405, headers: { Allow: "GET, POST" }, body: { ok: false, error: "method_not_allowed" } };
+}
+
 async function handleQuoteCcSettings({ method, headers, env, database, json }) {
   if (method === "GET") {
     const caller = await verifyQuotesCaller(headers, env, "view");
     if (!caller.ok) {
       return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
     }
-    await ensureQuoteCcColumn(database);
+    await ensureCompanySettingsReady(database);
     const rows = await database.query(`SELECT quote_cc_emails FROM public.company_settings WHERE id = 1`);
     const emails = dedupeEmails(rows[0]?.quote_cc_emails ?? []);
     return {
@@ -278,14 +520,21 @@ async function handleQuoteCcSettings({ method, headers, env, database, json }) {
         body: { ok: false, error: "too_many", message: "ניתן להגדיר עד 20 נמענים קבועים" },
       };
     }
-    await ensureQuoteCcColumn(database);
-    await database.query(
-      `INSERT INTO public.company_settings (id, quote_cc_emails, updated_at)
-       VALUES (1, $1::text[], now())
-       ON CONFLICT (id) DO UPDATE
-       SET quote_cc_emails = EXCLUDED.quote_cc_emails, updated_at = now()`,
+    await ensureCompanySettingsReady(database);
+    const updated = await database.query(
+      `UPDATE public.company_settings
+       SET quote_cc_emails = $1::text[], updated_at = now()
+       WHERE id = 1
+       RETURNING id`,
       [emails],
     );
+    if (!updated.length) {
+      await database.query(
+        `INSERT INTO public.company_settings (id, quote_cc_emails, updated_at)
+         VALUES (1, $1::text[], now())`,
+        [emails],
+      );
+    }
     return {
       status: 200,
       headers: { "Cache-Control": "no-store" },
@@ -317,7 +566,7 @@ async function handleSendQuoteEmailWithCc({ headers, env, database, body, id }) 
     return { status: 400, body: { ok: false, error: "invalid_email", message: "כתובת האימייל של הלקוח אינה תקינה" } };
   }
 
-  await ensureQuoteCcColumn(database);
+  await ensureCompanySettingsReady(database);
   let rawCcSource;
   if (body && Object.hasOwn(body, "cc") && body.cc !== undefined) {
     rawCcSource = body.cc;
@@ -495,7 +744,15 @@ const server = http.createServer(async (req, res) => {
     let result;
     try {
       const quoteSendMatch = url.pathname.match(/^\/api\/quotes\/([^/]+)\/send-email$/);
-      if (url.pathname === "/api/quotes/cc-settings") {
+      if (url.pathname === "/api/quotes/company-settings") {
+        result = await handleCompanyQuoteSettings({
+          method: req.method || "GET",
+          headers: req.headers,
+          env: process.env,
+          database: db,
+          json,
+        });
+      } else if (url.pathname === "/api/quotes/cc-settings") {
         result = await handleQuoteCcSettings({
           method: req.method || "GET",
           headers: req.headers,
@@ -544,18 +801,3 @@ const server = http.createServer(async (req, res) => {
   let filePath = path.join(distDir, url.pathname === "/" ? "index.html" : url.pathname);
   if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
     filePath = path.join(distDir, "index.html");
-  }
-  if (!fs.existsSync(filePath)) {
-    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-    res.end("Build dist/ not found. Run pnpm build first.");
-    return;
-  }
-  const ext = path.extname(filePath).toLowerCase();
-  res.writeHead(200, { "content-type": MIME_TYPES[ext] || "application/octet-stream" });
-  fs.createReadStream(filePath).pipe(res);
-});
-
-const port = Number(process.env.PORT || 3000);
-server.listen(port, () => {
-  console.log(`Nes Multimedia server running on port ${port}`);
-});
