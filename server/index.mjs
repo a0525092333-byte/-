@@ -577,7 +577,7 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
 
   const quote = (await db.query(`SELECT * FROM public.quotes WHERE id = $1`, [id]))[0];
   if (!quote) return { status: 404, body: { ok: false, message: "ההצעה לא נמצאה" } };
-  cconst [items, imageRows, settingsRows, eventRows] = await Promise.all([
+  const [items, imageRows, settingsRows, eventRows] = await Promise.all([
     db.query(`SELECT * FROM public.quote_items WHERE quote_id = $1 ORDER BY sort_order ASC, created_at ASC`, [id]),
     db.query(`SELECT position, mime, data_url, caption FROM public.quote_images WHERE quote_id = $1 ORDER BY position ASC, id ASC`, [id]),
     db.query(`SELECT company_name, tax_id, address, phone, email, logo_url FROM public.company_settings WHERE id = 1`),
@@ -641,6 +641,7 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
   }
   await db.query(`UPDATE public.quotes SET last_sent_at = now(), last_sent_to = $1 WHERE id = $2`, [[to, ...ccList].join(", "), id]).catch(() => {});
   return { status: 200, body: { ok: true, to, cc: ccList } };
+}
 
 async function bootstrapAuthPermissions() {
   try {
