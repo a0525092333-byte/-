@@ -2,8 +2,9 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes, randomUUID } from "node:crypto";
 import pg from "pg";
-import handler, { buildQuotePdf } from "./routes.mjs";
+import handler, { buildQuotePdf, hashPassword, verifyPassword } from "./routes.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -11,17 +12,15 @@ const distDir = path.resolve(rootDir, "dist");
 
 for (const envFile of [".env.local", ".env"]) {
   const fullPath = path.join(rootDir, envFile);
-  if (fs.existsSync(fullPath)) {
-    const lines = fs.readFileSync(fullPath, "utf8").split(/\r?\n/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim().replace(/^['"]|['"]$/g, "");
-      if (!(key in process.env)) process.env[key] = val;
-    }
+  if (!fs.existsSync(fullPath)) continue;
+  for (const line of fs.readFileSync(fullPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^['"]|['"]$/g, "");
+    if (!(key in process.env)) process.env[key] = val;
   }
 }
 
@@ -38,8 +37,7 @@ const pool = new pg.Pool({
 
 const db = {
   async query(text, params = []) {
-    const res = await pool.query(text, params);
-    return res.rows;
+    return (await pool.query(text, params)).rows;
   },
   async transaction(statements) {
     const client = await pool.connect();
@@ -47,8 +45,7 @@ const db = {
       await client.query("BEGIN");
       const results = [];
       for (const stmt of statements) {
-        const res = await client.query(stmt.text, stmt.params ?? []);
-        results.push(res.rows);
+        results.push((await client.query(stmt.text, stmt.params ?? [])).rows);
       }
       await client.query("COMMIT");
       return results;
@@ -61,658 +58,362 @@ const db = {
   },
 };
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-let companySettingsSchemaState = null;
-
-async function ensureCompanySettingsReady(database) {
-  if (companySettingsSchemaState) return companySettingsSchemaState;
-
-  await database.query(`
-    CREATE TABLE IF NOT EXISTS public.company_settings (
-      id integer PRIMARY KEY DEFAULT 1,
-      company_name text NOT NULL DEFAULT 'נס סגא לדים ומולטימדיה בע״מ',
-      logo_url text,
-      tax_id text,
-      address text,
-      phone text,
-      email text,
-      default_vat_rate numeric(5,2) NOT NULL DEFAULT 18,
-      default_terms jsonb NOT NULL DEFAULT '[]'::jsonb,
-      default_terms_text text,
-      default_notes text,
-      quote_number_prefix text NOT NULL DEFAULT '',
-      quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[],
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-  `);
-
-  await database.query(`
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS company_name text NOT NULL DEFAULT 'נס סגא לדים ומולטימדיה בע״מ';
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS logo_url text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS tax_id text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS address text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS phone text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS email text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_vat_rate numeric(5,2) NOT NULL DEFAULT 18;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_terms_text text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS default_notes text;
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS quote_number_prefix text NOT NULL DEFAULT '';
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[];
-    ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
-  `);
-
-  const colRows = await database.query(`
-    SELECT column_name, udt_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'company_settings'
-  `);
-
-  let termsUdt = colRows.find((r) => r.column_name === "default_terms")?.udt_name || null;
-  if (!termsUdt) {
-    await database.query(`
-      ALTER TABLE public.company_settings
-        ADD COLUMN IF NOT EXISTS default_terms jsonb NOT NULL DEFAULT '[]'::jsonb;
-    `);
-    termsUdt = "jsonb";
-  }
-
+async function runNeonAuthWork(workFn) {
   try {
-    const safeCols = colRows
-      .map((r) => String(r.column_name))
-      .filter((c) => !["backup_drive_token", "paperless_api_key"].includes(c) && /^[a-z0-9_]+$/i.test(c));
-    if (!safeCols.includes("default_terms")) safeCols.push("default_terms");
-    if (safeCols.length > 0) {
-      await database.query(
-        `GRANT SELECT (${safeCols.map((c) => `"${c}"`).join(", ")}) ON public.company_settings TO authenticated;`,
-      );
-      await database.query(`NOTIFY pgrst, 'reload schema';`);
-    }
-  } catch {
-    // Non-fatal: reads and writes are served directly through /api/quotes/company-settings
-  }
-
-  companySettingsSchemaState = { termsUdt };
-  return companySettingsSchemaState;
-}
-
-function parseEmailCandidates(raw) {
-  if (Array.isArray(raw)) {
-    return raw
-      .flatMap((item) => String(item ?? "").split(/[,;\s]+/))
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-  if (typeof raw === "string") {
-    return raw
-      .split(/[,;\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-  return [];
-}
-
-function dedupeEmails(list, excludeEmail = null) {
-  const excluded = excludeEmail ? String(excludeEmail).trim().toLowerCase() : "";
-  const seen = new Set();
-  const out = [];
-  for (const item of list) {
-    const clean = String(item ?? "").trim().toLowerCase();
-    if (!clean || (excluded && clean === excluded) || seen.has(clean)) continue;
-    seen.add(clean);
-    out.push(clean);
-  }
-  return out;
-}
-
-function normalizeTermsArray(raw) {
-  if (Array.isArray(raw)) {
-    return raw.map((t) => String(t ?? "").trim()).filter(Boolean);
-  }
-  if (typeof raw === "string" && raw.trim()) {
+    return await workFn((text, params = []) => db.query(text, params));
+  } catch (err) {
+    if (err?.code !== "42501") throw err;
+    const client = await pool.connect();
     try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        return parsed.map((t) => String(t ?? "").trim()).filter(Boolean);
-      }
-    } catch {
-      // treat as newline-separated text
+      await client.query("BEGIN");
+      await client.query("SET LOCAL ROLE neon_auth");
+      const out = await workFn(async (text, params = []) => (await client.query(text, params)).rows);
+      await client.query("RESET ROLE");
+      await client.query("COMMIT");
+      return out;
+    } catch (innerErr) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw innerErr;
+    } finally {
+      client.release();
     }
-    return raw.split(/\r?\n/).map((t) => t.trim()).filter(Boolean);
   }
-  return [];
 }
 
-function userIdFromAuth(headers) {
-  const auth = headers.authorization || headers.Authorization || "";
-  const token = String(auth).replace(/^Bearer\s+/i, "");
-  const parts = token.split(".");
+const BIDI_RE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+let quoteCcReady = false;
+
+const cleanEmail = (raw) => String(raw ?? "").replace(BIDI_RE, "").replace(/\s+/g, "").toLowerCase();
+const cleanPass = (raw) => String(raw ?? "").replace(BIDI_RE, "");
+const escapeHtml = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function parseEmailList(raw) {
+  const arr = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  return arr.flatMap((x) => String(x ?? "").split(/[,;\s]+/)).map(cleanEmail).filter(Boolean);
+}
+
+function dedupeEmails(list, exclude = "") {
+  const ex = cleanEmail(exclude);
+  const seen = new Set();
+  return list.map(cleanEmail).filter((e) => e && e !== ex && !seen.has(e) && seen.add(e));
+}
+
+function makeTempPassword() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let out = "Ns";
+  for (let i = 0; i < 8; i += 1) out += chars[randomBytes(1)[0] % chars.length];
+  return out + "9";
+}
+
+function wrapEmailHtml(heading, bodyHtml) {
+  return `<!doctype html><html dir="rtl" lang="he"><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:24px 12px;background:#f4f4f7;font-family:Arial,sans-serif;color:#1f2937">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:14px;overflow:hidden;border:1px solid #e5e7eb">
+    <div style="background:#312e81;padding:18px 24px;color:#fff;font-size:18px;font-weight:bold">נס מולטימדיה</div>
+    <div style="padding:24px"><h1 style="margin:0 0 12px;font-size:18px;color:#111827">${heading}</h1>${bodyHtml}</div>
+  </div>
+</body></html>`;
+}
+
+async function ensureQuoteCcColumn() {
+  if (quoteCcReady) return;
+  await db.query(`ALTER TABLE public.company_settings ADD COLUMN IF NOT EXISTS quote_cc_emails text[] NOT NULL DEFAULT '{}'::text[]`);
+  quoteCcReady = true;
+}
+
+async function upsertNeonCredentialPassword(email, plainName, newHash) {
+  const prof = await db.query(`SELECT id::text AS id, full_name FROM public.profiles WHERE lower(btrim(email)) = $1 LIMIT 1`, [email]);
+  return await runNeonAuthWork(async (q) => {
+    const uCols = new Set((await q(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'neon_auth' AND table_name = 'user'`)).map((r) => r.column_name));
+    const evCol = uCols.has("emailVerified") ? '"emailVerified"' : uCols.has("email_verified") ? "email_verified" : null;
+    const uCaCol = uCols.has("createdAt") ? '"createdAt"' : uCols.has("created_at") ? "created_at" : null;
+    const uUaCol = uCols.has("updatedAt") ? '"updatedAt"' : uCols.has("updated_at") ? "updated_at" : null;
+
+    const aCols = new Set((await q(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'neon_auth' AND table_name = 'account'`)).map((r) => r.column_name));
+    const uidCol = aCols.has("userId") ? '"userId"' : "user_id";
+    const pidCol = aCols.has("providerId") ? '"providerId"' : "provider_id";
+    const aidCol = aCols.has("accountId") ? '"accountId"' : "account_id";
+    const aCaCol = aCols.has("createdAt") ? '"createdAt"' : aCols.has("created_at") ? "created_at" : null;
+    const aUaCol = aCols.has("updatedAt") ? '"updatedAt"' : aCols.has("updated_at") ? "updated_at" : null;
+
+    const users = await q(`SELECT id::text AS id, name FROM neon_auth."user" WHERE lower(btrim(email)) = $1 LIMIT 1`, [email]);
+    let authUserId = users[0]?.id || null;
+
+    if (!authUserId) {
+      if (!prof[0]) return { ok: false };
+      authUserId = prof[0].id;
+      const cols = ["id", "name", "email"];
+      const vals = ["$1", "$2", "$3"];
+      if (evCol) { cols.push(evCol); vals.push("true"); }
+      if (uCaCol) { cols.push(uCaCol); vals.push("now()"); }
+      if (uUaCol) { cols.push(uUaCol); vals.push("now()"); }
+      if (uCols.has("role")) { cols.push("role"); vals.push(email === "a0525092333@gmail.com" ? "'admin'" : "'user'"); }
+      if (uCols.has("banned")) { cols.push("banned"); vals.push("false"); }
+      await q(`INSERT INTO neon_auth."user" (${cols.join(", ")}) VALUES (${vals.join(", ")})`, [
+        authUserId,
+        plainName || prof[0].full_name || email.split("@")[0],
+        email,
+      ]);
+    } else {
+      const sets = ["email = $1"];
+      if (evCol) sets.push(`${evCol} = true`);
+      if (uUaCol) sets.push(`${uUaCol} = now()`);
+      if (uCols.has("banned")) sets.push("banned = false");
+      await q(`UPDATE neon_auth."user" SET ${sets.join(", ")} WHERE id::text = $2`, [email, authUserId]);
+    }
+
+    const existing = await q(`SELECT id::text AS id, password FROM neon_auth.account WHERE ${uidCol}::text = $1 AND ${pidCol} = 'credential' LIMIT 1`, [authUserId]);
+    const previousHash = existing[0]?.password || null;
+    if (existing[0]) {
+      const sets = ["password = $1"];
+      if (aUaCol) sets.push(`${aUaCol} = now()`);
+      await q(`UPDATE neon_auth.account SET ${sets.join(", ")} WHERE id::text = $2`, [newHash, existing[0].id]);
+    } else {
+      const cols = ["id", aidCol, pidCol, uidCol, "password"];
+      const vals = ["$1", "$2", "'credential'", "$3", "$4"];
+      if (aCaCol) { cols.push(aCaCol); vals.push("now()"); }
+      if (aUaCol) { cols.push(aUaCol); vals.push("now()"); }
+      await q(`INSERT INTO neon_auth.account (${cols.join(", ")}) VALUES (${vals.join(", ")})`, [randomUUID(), authUserId, authUserId, newHash]);
+    }
+    return { ok: true, userId: authUserId, previousHash };
+  });
+}
+
+async function handleForgotPasswordCustom(env, body) {
+  const email = cleanEmail(body?.email);
+  if (!EMAIL_RE.test(email)) return { status: 400, body: { ok: false, message: "נא להזין כתובת אימייל תקינה" } };
+  const key = String(env.RESEND_API_KEY || "").trim();
+  if (!key) return { status: 503, body: { ok: false, message: "חסר מפתח RESEND_API_KEY בלשונית Environment ב-Render" } };
+
+  const profRows = await db.query(`SELECT id::text AS id, full_name FROM public.profiles WHERE lower(btrim(email)) = $1 LIMIT 1`, [email]);
+  const authRows = await runNeonAuthWork((q) => q(`SELECT id::text AS id, name FROM neon_auth."user" WHERE lower(btrim(email)) = $1 LIMIT 1`, [email])).catch(() => []);
+  if (!profRows[0] && !authRows[0]) {
+    return { status: 200, body: { ok: true, message: "אם הכתובת רשומה במערכת, נשלחה אליה סיסמה זמנית" } };
+  }
+  const fullName = profRows[0]?.full_name || authRows[0]?.name || "";
+  const tempPassword = makeTempPassword();
+  const hash = await hashPassword(tempPassword);
+  if (!(await verifyPassword(tempPassword, hash))) {
+    return { status: 500, body: { ok: false, message: "שגיאה ביצירת סיסמה זמנית — נסה שוב" } };
+  }
+  const updated = await upsertNeonCredentialPassword(email, fullName, hash);
+  if (!updated.ok) return { status: 500, body: { ok: false, message: "לא הצלחנו לעדכן סיסמה לחשבון זה" } };
+
+  const html = wrapEmailHtml(
+    "סיסמה זמנית חדשה",
+    `<p style="margin:0 0 12px;font-size:14px">שלום${fullName ? ` ${escapeHtml(fullName)}` : ""},</p>
+     <p style="margin:0 0 8px;font-size:13px">הסיסמה הזמנית החדשה שלך להתחברות למערכת:</p>
+     <p style="margin:0 0 16px;font-size:22px;font-weight:bold;letter-spacing:2px;background:#eef2ff;border:1px solid #c7d2fe;padding:12px;border-radius:10px;text-align:center;color:#312e81" dir="ltr">${escapeHtml(tempPassword)}</p>
+     <p style="margin:0;font-size:13px">התחבר עם <span dir="ltr">${escapeHtml(email)}</span> והחלף לסיסמה קבועה.</p>`,
+  );
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      from: "נס מולטימדיה <no-reply@nsmm.work>",
+      to: [email],
+      reply_to: env.INVITE_FROM_EMAIL || "a0525092333@gmail.com",
+      subject: "סיסמה זמנית חדשה — נס מולטימדיה",
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    if (updated.previousHash) await upsertNeonCredentialPassword(email, fullName, updated.previousHash).catch(() => {});
+    return { status: 503, body: { ok: false, message: `שליחת המייל נכשלה מול Resend (${res.status}): ${errText.slice(0, 140)}` } };
+  }
+  await db.query(`UPDATE public.profiles SET must_change_password = true WHERE id::text = $1 OR lower(btrim(email)) = $2`, [updated.userId, email]).catch(() => {});
+  return { status: 200, body: { ok: true, message: "סיסמה זמנית נשלחה לכתובת המייל שלך" } };
+}
+
+function userIdFromBearer(headers) {
+  const parts = String(headers.authorization || headers.Authorization || "").replace(/^Bearer\s+/i, "").split(".");
   if (parts.length < 2) return null;
   try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-    return payload.sub || payload.user_id || payload.id || null;
+    const p = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return p.sub || p.user_id || p.id || null;
   } catch {
     return null;
   }
 }
 
-async function verifyQuotesCaller(headers, env, action = "edit") {
+async function verifyModuleAccess(headers, env, module, action = "edit") {
   const auth = headers.authorization || headers.Authorization;
-  if (!auth) {
-    return { ok: false, status: 401, error: "unauthorized", message: "פג תוקף החיבור — התחבר מחדש ונסה שוב" };
-  }
   const base = String(env.NEON_DATA_API_URL || env.VITE_NEON_DATA_API_URL || "").replace(/\/+$/, "");
-  if (!base) {
-    return { ok: false, status: 500, error: "server", message: "שירות האימות אינו מוגדר" };
-  }
+  if (!auth || !base) return { ok: false, status: 401, message: "פג תוקף החיבור — התחבר מחדש" };
   try {
-    const checks = [
-      fetch(`${base}/rpc/is_super_admin`, {
-        method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
-        body: "{}",
-      }),
-      fetch(`${base}/rpc/is_approved`, {
-        method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
-        body: "{}",
-      }),
-      fetch(`${base}/rpc/has_permission`, {
-        method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
-        body: JSON.stringify({ p_module: "quotes", p_action: action }),
-      }),
-    ];
-    if (action === "view") {
-      checks.push(
-        fetch(`${base}/rpc/has_permission`, {
-          method: "POST",
-          headers: { authorization: auth, "content-type": "application/json" },
-          body: JSON.stringify({ p_module: "quotes", p_action: "edit" }),
-        }),
-      );
-    }
-    const [adminRes, approvedRes, permRes, editPermRes] = await Promise.all(checks);
-    const superAdmin = adminRes.ok ? await adminRes.json() : null;
-    const approved = approvedRes.ok ? await approvedRes.json() : null;
-    const perm = permRes.ok ? await permRes.json() : null;
-    const editPerm = editPermRes && editPermRes.ok ? await editPermRes.json() : null;
-
-    if (superAdmin === true) return { ok: true, isAdmin: true };
-    if (adminRes.status === 401 || approvedRes.status === 401) {
-      return { ok: false, status: 401, error: "unauthorized", message: "פג תוקף החיבור — התחבר מחדש ונסה שוב" };
-    }
-    if (!approvedRes.ok) {
-      return { ok: false, status: 503, error: "server", message: "לא הצלחנו לבדוק את הרשאת החשבון — נסה שוב" };
-    }
-    if (approved !== true) {
-      return { ok: false, status: 403, error: "pending_approval", message: "אין הרשאה — החשבון ממתין לאישור מנהל" };
-    }
-    if (perm === true || editPerm === true) return { ok: true, isAdmin: false };
-    return {
-      ok: false,
-      status: 403,
-      error: "forbidden",
-      message: action === "edit" ? "אין לך הרשאה לערוך או לשלוח הצעות מחיר" : "אין לך הרשאה לצפות בהגדרות הצעות מחיר",
-    };
-  } catch (e) {
-    console.error("[quote-settings] auth check failed", e?.message || e);
-    return { ok: false, status: 503, error: "server", message: "שגיאה בבדיקת ההרשאות — נסה שוב" };
+    const [adminRes, approvedRes, permRes] = await Promise.all([
+      fetch(`${base}/rpc/is_super_admin`, { method: "POST", headers: { authorization: auth, "content-type": "application/json" }, body: "{}" }),
+      fetch(`${base}/rpc/is_approved`, { method: "POST", headers: { authorization: auth, "content-type": "application/json" }, body: "{}" }),
+      fetch(`${base}/rpc/has_permission`, { method: "POST", headers: { authorization: auth, "content-type": "application/json" }, body: JSON.stringify({ p_module: module, p_action: action }) }),
+    ]);
+    if (adminRes.ok && (await adminRes.json()) === true) return { ok: true };
+    if (adminRes.status === 401 || approvedRes.status === 401) return { ok: false, status: 401, message: "פג תוקף החיבור — התחבר מחדש" };
+    if (!approvedRes.ok || (await approvedRes.json()) !== true) return { ok: false, status: 403, message: "החשבון ממתין לאישור מנהל" };
+    if (permRes.ok && (await permRes.json()) === true) return { ok: true };
+    return { ok: false, status: 403, message: "אין לך הרשאה לבצע פעולה זו" };
+  } catch {
+    return { ok: false, status: 503, message: "שגיאה בבדיקת ההרשאות — נסה שוב" };
   }
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+async function handleAdminResetCustom({ headers, env, body }) {
+  const caller = await verifyModuleAccess(headers, env, "users", "edit");
+  if (!caller.ok) return { status: caller.status, body: { ok: false, message: caller.message } };
+  const targetId = String(body?.user_id || "").trim();
+  if (!targetId) return { status: 400, body: { ok: false, message: "חסר מזהה משתמש" } };
+  const target = (await db.query(`SELECT id::text AS id, email, full_name FROM public.profiles WHERE id::text = $1`, [targetId]))[0];
+  if (!target?.email) return { status: 404, body: { ok: false, message: "המשתמש לא נמצא" } };
+  const password = makeTempPassword();
+  const hash = await hashPassword(password);
+  const updated = await upsertNeonCredentialPassword(cleanEmail(target.email), target.full_name, hash);
+  if (!updated.ok) return { status: 500, body: { ok: false, message: "לא הצלחנו לעדכן סיסמה למשתמש" } };
+  await db.query(`UPDATE public.profiles SET must_change_password = true WHERE id::text = $1`, [target.id]).catch(() => {});
+  return { status: 200, body: { ok: true, password, email_configured: Boolean(env.RESEND_API_KEY), target } };
 }
 
-function emailShell({ heading, bodyHtml }) {
-  return `<!doctype html>
-<html dir="rtl" lang="he">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f4f7;font-family:Arial,'Segoe UI',sans-serif;color:#1f2937">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:24px 12px">
-    <tr><td align="center">
-      <table role="presentation" width="100%" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e5e7eb">
-        <tr><td style="background:#312e81;padding:20px 24px">
-          <p style="margin:0;color:#ffffff;font-size:18px;font-weight:bold">נס מולטימדיה</p>
-          <p style="margin:4px 0 0;color:#c7d2fe;font-size:12px">מערכת ניהול הפקות אירועים</p>
-        </td></tr>
-        <tr><td style="padding:24px">
-          <h1 style="margin:0 0 12px;font-size:18px;color:#111827">${heading}</h1>
-          ${bodyHtml}
-        </td></tr>
-        <tr><td style="padding:16px 24px;background:#f9fafb;border-top:1px solid #e5e7eb">
-          <p style="margin:0;font-size:11px;color:#6b7280">הודעה זו נשלחה ממערכת "נס מולטימדיה". אם לא ביקשת אותה, אפשר להתעלם.</p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body></html>`;
+async function handleQuoteCcSettings({ method, headers, env, json }) {
+  if (method === "GET") {
+    const okView = await verifyModuleAccess(headers, env, "quotes", "view");
+    const access = okView.ok ? okView : await verifyModuleAccess(headers, env, "quotes", "edit");
+    if (!access.ok) return { status: access.status, body: { ok: false, message: access.message } };
+    await ensureQuoteCcColumn();
+    const rows = await db.query(`SELECT quote_cc_emails FROM public.company_settings WHERE id = 1`);
+    return { status: 200, headers: { "Cache-Control": "no-store" }, body: { ok: true, emails: dedupeEmails(rows[0]?.quote_cc_emails ?? []) } };
+  }
+  if (method === "POST") {
+    const caller = await verifyModuleAccess(headers, env, "quotes", "edit");
+    if (!caller.ok) return { status: caller.status, body: { ok: false, message: caller.message } };
+    const candidates = parseEmailList(json()?.emails);
+    const bad = candidates.find((c) => !EMAIL_RE.test(c));
+    if (bad) return { status: 400, body: { ok: false, message: `כתובת אימייל לא תקינה: ${bad}` } };
+    const emails = dedupeEmails(candidates);
+    await ensureQuoteCcColumn();
+    await db.query(
+      `INSERT INTO public.company_settings (id, quote_cc_emails, updated_at) VALUES (1, $1::text[], now())
+       ON CONFLICT (id) DO UPDATE SET quote_cc_emails = EXCLUDED.quote_cc_emails, updated_at = now()`,
+      [emails],
+    );
+    return { status: 200, headers: { "Cache-Control": "no-store" }, body: { ok: true, emails } };
+  }
+  return { status: 405, body: { ok: false, error: "method_not_allowed" } };
 }
 
-function jpegDimensions(buffer) {
+function jpegDims(buf) {
   let i = 2;
-  while (i + 9 < buffer.length) {
-    if (buffer[i] !== 0xff) {
-      i += 1;
-      continue;
-    }
-    const marker = buffer[i + 1];
-    if (marker === 0xd8 || marker === 0xd9) {
-      i += 2;
-      continue;
-    }
-    const len = buffer.readUInt16BE(i + 2);
-    if (marker >= 0xc0 && marker <= 0xc3) {
-      return { height: buffer.readUInt16BE(i + 5), width: buffer.readUInt16BE(i + 7) };
-    }
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) { i += 1; continue; }
+    const m = buf[i + 1];
+    if (m === 0xd8 || m === 0xd9) { i += 2; continue; }
+    const len = buf.readUInt16BE(i + 2);
+    if (m >= 0xc0 && m <= 0xc3) return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
     i += 2 + len;
   }
   return null;
 }
 
-async function handleCompanyQuoteSettings({ method, headers, env, database, json }) {
-  if (method === "GET") {
-    const caller = await verifyQuotesCaller(headers, env, "view");
-    if (!caller.ok) {
-      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
-    }
-    await ensureCompanySettingsReady(database);
-    const rows = await database.query(`
-      SELECT id, company_name, logo_url, tax_id, address, phone, email,
-             default_vat_rate, default_terms, default_terms_text, default_notes,
-             quote_number_prefix, quote_cc_emails, updated_at
-      FROM public.company_settings
-      WHERE id = 1
-      LIMIT 1
-    `);
-    const row = rows[0] || null;
-    return {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-      body: {
-        ok: true,
-        settings: row
-          ? {
-              ...row,
-              default_vat_rate: Number(row.default_vat_rate ?? 18),
-              default_terms: normalizeTermsArray(row.default_terms),
-              quote_cc_emails: dedupeEmails(row.quote_cc_emails ?? []),
-            }
-          : null,
-      },
-    };
-  }
+async function handleSendQuoteWithCc({ headers, env, body, id }) {
+  const caller = await verifyModuleAccess(headers, env, "quotes", "edit");
+  if (!caller.ok) return { status: caller.status, body: { ok: false, message: caller.message } };
+  const key = String(env.RESEND_API_KEY || "").trim();
+  if (!key) return { status: 503, body: { ok: false, message: "חסר RESEND_API_KEY בהגדרות השרת ב-Render" } };
 
-  if (method === "POST") {
-    const caller = await verifyQuotesCaller(headers, env, "edit");
-    if (!caller.ok) {
-      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
-    }
-    const body = json();
-    const companyName = String(body?.company_name ?? "").trim();
-    if (!companyName) {
-      return { status: 400, body: { ok: false, error: "missing_name", message: "נא להזין שם חברה." } };
-    }
+  const to = cleanEmail(body?.to);
+  if (!EMAIL_RE.test(to)) return { status: 400, body: { ok: false, message: "כתובת האימייל של הלקוח אינה תקינה" } };
 
-    const logoUrl = body?.logo_url ? String(body.logo_url) : null;
-    const taxId = body?.tax_id ? String(body.tax_id).trim() || null : null;
-    const address = body?.address ? String(body.address).trim() || null : null;
-    const phone = body?.phone ? String(body.phone).trim() || null : null;
-    const email = body?.email ? String(body.email).trim() || null : null;
-    const vatNum = Number(body?.default_vat_rate);
-    const defaultVatRate = Number.isFinite(vatNum) && vatNum >= 0 ? vatNum : 18;
-    const defaultTerms = normalizeTermsArray(body?.default_terms);
-    const defaultTermsText = body?.default_terms_text ? String(body.default_terms_text).trim() || null : null;
-    const defaultNotes = body?.default_notes ? String(body.default_notes).trim() || null : null;
-    const quoteNumberPrefix = String(body?.quote_number_prefix ?? "").trim();
+  await ensureQuoteCcColumn();
+  const rawCc = body && Object.hasOwn(body, "cc") && body.cc !== undefined
+    ? body.cc
+    : (await db.query(`SELECT quote_cc_emails FROM public.company_settings WHERE id = 1`))[0]?.quote_cc_emails ?? [];
+  const ccParsed = parseEmailList(rawCc);
+  const badCc = ccParsed.find((c) => !EMAIL_RE.test(c));
+  if (badCc) return { status: 400, body: { ok: false, message: `כתובת עותק (CC) לא תקינה: ${badCc}` } };
+  const ccList = dedupeEmails(ccParsed, to);
 
-    let hasCcUpdate = false;
-    let ccEmails = [];
-    if (body && Object.hasOwn(body, "quote_cc_emails") && body.quote_cc_emails !== undefined) {
-      hasCcUpdate = true;
-      const candidates = parseEmailCandidates(body.quote_cc_emails);
-      for (const candidate of candidates) {
-        if (!EMAIL_RE.test(candidate)) {
-          return {
-            status: 400,
-            body: { ok: false, error: "invalid_email", message: `כתובת אימייל לא תקינה: ${candidate}` },
-          };
-        }
-      }
-      ccEmails = dedupeEmails(candidates);
-      if (ccEmails.length > 20) {
-        return {
-          status: 400,
-          body: { ok: false, error: "too_many", message: "ניתן להגדיר עד 20 נמענים קבועים" },
-        };
-      }
-    }
-
-    const { termsUdt } = await ensureCompanySettingsReady(database);
-    const termsParam = termsUdt === "_text" ? defaultTerms : JSON.stringify(defaultTerms);
-    const termsCast =
-      termsUdt === "_text"
-        ? "::text[]"
-        : termsUdt === "jsonb"
-          ? "::jsonb"
-          : termsUdt === "json"
-            ? "::json"
-            : "::text";
-
-    const updateParams = [
-      companyName,
-      logoUrl,
-      taxId,
-      address,
-      phone,
-      email,
-      defaultVatRate,
-      termsParam,
-      defaultTermsText,
-      defaultNotes,
-      quoteNumberPrefix,
-    ];
-    if (hasCcUpdate) updateParams.push(ccEmails);
-
-    const updated = await database.query(
-      `UPDATE public.company_settings
-       SET company_name = $1,
-           logo_url = $2,
-           tax_id = $3,
-           address = $4,
-           phone = $5,
-           email = $6,
-           default_vat_rate = $7,
-           default_terms = $8${termsCast},
-           default_terms_text = $9,
-           default_notes = $10,
-           quote_number_prefix = $11,
-           ${hasCcUpdate ? "quote_cc_emails = $12::text[]," : ""}
-           updated_at = now()
-       WHERE id = 1
-       RETURNING id`,
-      updateParams,
-    );
-
-    if (!updated.length) {
-      await database.query(
-        `INSERT INTO public.company_settings (
-           id, company_name, logo_url, tax_id, address, phone, email,
-           default_vat_rate, default_terms, default_terms_text, default_notes,
-           quote_number_prefix, quote_cc_emails, updated_at
-         ) VALUES (
-           1, $1, $2, $3, $4, $5, $6,
-           $7, $8${termsCast}, $9, $10,
-           $11, $12::text[], now()
-         )`,
-        [
-          companyName,
-          logoUrl,
-          taxId,
-          address,
-          phone,
-          email,
-          defaultVatRate,
-          termsParam,
-          defaultTermsText,
-          defaultNotes,
-          quoteNumberPrefix,
-          hasCcUpdate ? ccEmails : [],
-        ],
-      );
-    }
-
-    const savedRows = await database.query(
-      `SELECT quote_cc_emails FROM public.company_settings WHERE id = 1 LIMIT 1`,
-    );
-    return {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-      body: {
-        ok: true,
-        emails: dedupeEmails(savedRows[0]?.quote_cc_emails ?? []),
-      },
-    };
-  }
-
-  return { status: 405, headers: { Allow: "GET, POST" }, body: { ok: false, error: "method_not_allowed" } };
-}
-
-async function handleQuoteCcSettings({ method, headers, env, database, json }) {
-  if (method === "GET") {
-    const caller = await verifyQuotesCaller(headers, env, "view");
-    if (!caller.ok) {
-      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
-    }
-    await ensureCompanySettingsReady(database);
-    const rows = await database.query(`SELECT quote_cc_emails FROM public.company_settings WHERE id = 1`);
-    const emails = dedupeEmails(rows[0]?.quote_cc_emails ?? []);
-    return {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-      body: { ok: true, emails },
-    };
-  }
-
-  if (method === "POST") {
-    const caller = await verifyQuotesCaller(headers, env, "edit");
-    if (!caller.ok) {
-      return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
-    }
-    const body = json();
-    const candidates = parseEmailCandidates(body?.emails);
-    for (const candidate of candidates) {
-      if (!EMAIL_RE.test(candidate)) {
-        return {
-          status: 400,
-          body: { ok: false, error: "invalid_email", message: `כתובת אימייל לא תקינה: ${candidate}` },
-        };
-      }
-    }
-    const emails = dedupeEmails(candidates);
-    if (emails.length > 20) {
-      return {
-        status: 400,
-        body: { ok: false, error: "too_many", message: "ניתן להגדיר עד 20 נמענים קבועים" },
-      };
-    }
-    await ensureCompanySettingsReady(database);
-    const updated = await database.query(
-      `UPDATE public.company_settings
-       SET quote_cc_emails = $1::text[], updated_at = now()
-       WHERE id = 1
-       RETURNING id`,
-      [emails],
-    );
-    if (!updated.length) {
-      await database.query(
-        `INSERT INTO public.company_settings (id, quote_cc_emails, updated_at)
-         VALUES (1, $1::text[], now())`,
-        [emails],
-      );
-    }
-    return {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-      body: { ok: true, emails },
-    };
-  }
-
-  return { status: 405, headers: { Allow: "GET, POST" }, body: { ok: false, error: "method_not_allowed" } };
-}
-
-async function handleSendQuoteEmailWithCc({ headers, env, database, body, id }) {
-  const caller = await verifyQuotesCaller(headers, env, "edit");
-  if (!caller.ok) {
-    return { status: caller.status, body: { ok: false, error: caller.error, message: caller.message } };
-  }
-  if (!id) {
-    return { status: 400, body: { ok: false, error: "invalid", message: "חסר מזהה הצעה" } };
-  }
-  const key = env.RESEND_API_KEY;
-  if (!key) {
-    return {
-      status: 503,
-      body: { ok: false, error: "email_not_configured", message: "שליחת דוא״ל אינה מוגדרת במערכת (חסר RESEND_API_KEY)" },
-    };
-  }
-
-  const to = String(body?.to ?? "").trim();
-  if (!EMAIL_RE.test(to)) {
-    return { status: 400, body: { ok: false, error: "invalid_email", message: "כתובת האימייל של הלקוח אינה תקינה" } };
-  }
-
-  await ensureCompanySettingsReady(database);
-  let rawCcSource;
-  if (body && Object.hasOwn(body, "cc") && body.cc !== undefined) {
-    rawCcSource = body.cc;
-  } else {
-    const ccRows = await database.query(`SELECT quote_cc_emails FROM public.company_settings WHERE id = 1`);
-    rawCcSource = ccRows[0]?.quote_cc_emails ?? [];
-  }
-
-  const ccCandidates = parseEmailCandidates(rawCcSource);
-  for (const candidate of ccCandidates) {
-    if (!EMAIL_RE.test(candidate)) {
-      return {
-        status: 400,
-        body: { ok: false, error: "invalid_cc", message: `כתובת אימייל בעותק (CC) אינה תקינה: ${candidate}` },
-      };
-    }
-  }
-  const ccList = dedupeEmails(ccCandidates, to);
-  if (ccList.length > 20) {
-    return {
-      status: 400,
-      body: { ok: false, error: "too_many_cc", message: "ניתן לשלוח עד 20 נמענים בעותק (CC)" },
-    };
-  }
-
-  const quoteRows = await database.query(`SELECT * FROM public.quotes WHERE id = $1`, [id]);
-  const quote = quoteRows[0];
-  if (!quote) {
-    return { status: 404, body: { ok: false, error: "not_found", message: "ההצעה לא נמצאה" } };
-  }
-  const items = await database.query(
-    `SELECT * FROM public.quote_items WHERE quote_id = $1 ORDER BY sort_order ASC, created_at ASC`,
-    [id],
-  );
-  const imageRows = await database.query(
-    `SELECT position, mime, data_url, caption FROM public.quote_images WHERE quote_id = $1 ORDER BY position ASC, id ASC`,
-    [id],
-  );
-  const settingsRows = await database.query(
-    `SELECT company_name, tax_id, address, phone, email, logo_url FROM public.company_settings WHERE id = 1`,
-  );
+  const quote = (await db.query(`SELECT * FROM public.quotes WHERE id = $1`, [id]))[0];
+  if (!quote) return { status: 404, body: { ok: false, message: "ההצעה לא נמצאה" } };
+  const [items, imageRows, settingsRows, eventRows] = await Promise.all([
+    db.query(`SELECT * FROM public.quote_items WHERE quote_id = $1 ORDER BY sort_order ASC, created_at ASC`, [id]),
+    db.query(`SELECT position, mime, data_url, caption FROM public.quote_images WHERE quote_id = $1 ORDER BY position ASC, id ASC`, [id]),
+    db.query(`SELECT company_name, tax_id, address, phone, email, logo_url FROM public.company_settings WHERE id = 1`),
+    quote.event_id ? db.query(`SELECT address FROM public.events WHERE id = $1`, [quote.event_id]) : Promise.resolve([]),
+  ]);
   const settings = settingsRows[0] || {};
-  const eventRows = quote.event_id
-    ? await database.query(`SELECT address FROM public.events WHERE id = $1`, [quote.event_id])
-    : [];
   const eventAddress = (quote.event_address && String(quote.event_address).trim()) || eventRows[0]?.address || null;
 
   let customLogo;
   if (settings.logo_url) {
     try {
-      const logoRes = await fetch(settings.logo_url);
-      if (logoRes.ok) {
-        const contentType = logoRes.headers.get("content-type") || "";
-        if (/jpe?g/i.test(contentType)) {
-          const buffer = Buffer.from(await logoRes.arrayBuffer());
-          const dims = jpegDimensions(buffer);
-          if (dims) customLogo = { buffer, width: dims.width, height: dims.height };
-        }
+      const lr = await fetch(settings.logo_url);
+      if (lr.ok && /jpe?g/i.test(lr.headers.get("content-type") || "")) {
+        const buffer = Buffer.from(await lr.arrayBuffer());
+        const dims = jpegDims(buffer);
+        if (dims) customLogo = { buffer, width: dims.width, height: dims.height };
       }
-    } catch (e) {
-      console.error("[quote-email] logo fetch failed", e?.message || e);
-    }
+    } catch {}
   }
 
-  let pdf;
-  try {
-    pdf = buildQuotePdf({
-      quote,
-      items,
-      settings,
-      eventAddress,
-      ...(customLogo ? { logo: customLogo } : {}),
-      images: imageRows,
-    });
-  } catch (e) {
-    console.error("[quote-email] pdf failed", e?.message || e);
-    return { status: 500, body: { ok: false, error: "pdf_failed", message: "לא הצלחנו להפיק את קובץ ה-PDF" } };
-  }
+  const pdf = buildQuotePdf({ quote, items, settings, eventAddress, ...(customLogo ? { logo: customLogo } : {}), images: imageRows });
+  const senderId = userIdFromBearer(headers);
+  const senderEmail = senderId ? (await db.query(`SELECT email FROM public.profiles WHERE id = $1`, [senderId]))[0]?.email : null;
+  const replyTo = senderEmail || env.INVITE_FROM_EMAIL || settings.email || "a0525092333@gmail.com";
+  const msg = String(body?.message ?? "").trim();
 
-  const senderId = userIdFromAuth(headers);
-  let replyTo = env.INVITE_FROM_EMAIL || settings.email || "a0525092333@gmail.com";
-  if (senderId) {
-    const senderRows = await database.query(`SELECT email FROM public.profiles WHERE id = $1`, [senderId]);
-    if (senderRows[0]?.email) replyTo = senderRows[0].email;
-  }
+  const html = wrapEmailHtml(
+    `הצעת מחיר מס׳ ${escapeHtml(quote.quote_number)}`,
+    `<p style="margin:0 0 12px;font-size:14px">שלום${quote.client_name ? ` ${escapeHtml(quote.client_name)}` : ""},</p>
+     <p style="margin:0 0 12px;font-size:14px">מצורפת הצעת המחיר שלך כקובץ PDF.</p>
+     ${msg ? `<p style="margin:0 0 12px;font-size:14px;white-space:pre-wrap">${escapeHtml(msg)}</p>` : ""}`,
+  );
 
-  const from = "נס מולטימדיה <no-reply@nsmm.work>";
-  const subject = `הצעת מחיר מס׳ ${quote.quote_number} — ${settings.company_name || "נס מולטימדיה"}`;
-  const message = String(body?.message ?? "").trim();
-  const html = emailShell({
-    heading: `הצעת מחיר מס׳ ${quote.quote_number}`,
-    bodyHtml: `
-      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${quote.client_name ? ` ${escapeHtml(quote.client_name)}` : ""},</p>
-      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">מצורפת הצעת המחיר שלך כקובץ PDF.</p>
-      ${message ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;white-space:pre-wrap">${escapeHtml(message)}</p>` : ""}
-      <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">הקובץ המצורף: הצעת-מחיר-${escapeHtml(quote.quote_number)}.pdf</p>
-    `,
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      from: "נס מולטימדיה <no-reply@nsmm.work>",
+      to: [to],
+      ...(ccList.length ? { cc: ccList } : {}),
+      reply_to: replyTo,
+      subject: `הצעת מחיר מס׳ ${quote.quote_number} — ${settings.company_name || "נס מולטימדיה"}`,
+      html,
+      attachments: [{ filename: `הצעת-מחיר-${quote.quote_number}.pdf`, content: pdf.toString("base64") }],
+    }),
   });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    return { status: 503, body: { ok: false, message: `שליחת ההצעה נכשלה: ${errText.slice(0, 200)}` } };
+  }
+  await db.query(`UPDATE public.quotes SET last_sent_at = now(), last_sent_to = $1 WHERE id = $2`, [[to, ...ccList].join(", "), id]).catch(() => {});
+  return { status: 200, body: { ok: true, to, cc: ccList } };
+}
 
+async function bootstrapAuthPermissions() {
   try {
-    const res = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        from,
-        to: [to],
-        ...(ccList.length > 0 ? { cc: ccList } : {}),
-        reply_to: replyTo,
-        subject,
-        html,
-        attachments: [
-          { filename: `הצעת-מחיר-${quote.quote_number}.pdf`, content: pdf.toString("base64") },
-        ],
-      }),
-    });
-    const text = await res.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = null;
+    const owner = (await db.query("SELECT current_user AS u"))[0]?.u;
+    if (owner && /^[a-zA-Z0-9_]+$/.test(owner)) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL ROLE neon_auth");
+        await client.query(`GRANT USAGE ON SCHEMA neon_auth TO "${owner}"`);
+        await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA neon_auth TO "${owner}"`);
+        await client.query("RESET ROLE");
+        await client.query("COMMIT");
+      } catch {
+        await client.query("ROLLBACK").catch(() => {});
+      } finally {
+        client.release();
+      }
     }
-    if (!res.ok) {
-      const reason = String(data?.message || data?.error || `HTTP ${res.status}`).slice(0, 300);
-      console.error("[quote-email] send failed", res.status, reason);
-      return {
-        status: 503,
-        body: { ok: false, error: "send_failed", message: `שליחת ההצעה נכשלה: ${reason}` },
-      };
+    const cols = new Set((await db.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'neon_auth' AND table_name = 'user'`)).map((r) => r.column_name));
+    const evCol = cols.has("emailVerified") ? '"emailVerified"' : cols.has("email_verified") ? "email_verified" : null;
+    if (evCol) {
+      await db.query(`UPDATE neon_auth."user" SET ${evCol} = true WHERE ${evCol} IS DISTINCT FROM true`);
     }
-    try {
-      const recipientsSummary = [to, ...ccList].join(", ");
-      await database.query(`UPDATE public.quotes SET last_sent_at = now(), last_sent_to = $1 WHERE id = $2`, [
-        recipientsSummary,
-        id,
-      ]);
-    } catch (e) {
-      console.error("[quote-email] bookkeeping failed", e?.message || e);
-    }
-    return { status: 200, body: { ok: true, to, cc: ccList } };
-  } catch (e) {
-    console.error("[quote-email] error", e?.message || e);
-    return {
-      status: 503,
-      body: { ok: false, error: "send_failed", message: "שליחת ההצעה נכשלה — בדוק את החיבור ונסה שוב" },
-    };
+  } catch (err) {
+    console.error("[bootstrap] auth check skipped:", err?.message || err);
   }
 }
 
@@ -731,43 +432,44 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
-  const proto = req.headers["x-forwarded-proto"] || "http";
+  const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
   const host = req.headers.host || "localhost:3000";
-  const url = new URL(req.url || "/", `${proto}://${host}`);
+  const requestOrigin = `${proto}://${host}`;
+  const url = new URL(req.url || "/", requestOrigin);
 
   if (url.pathname.startsWith("/api/")) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const rawBody = Buffer.concat(chunks);
+    let rawBody = Buffer.concat(chunks);
+
+    if ((url.pathname === "/api/auth/sign-in/email" || url.pathname === "/api/auth/sign-up/email") && req.method === "POST" && rawBody.length) {
+      try {
+        const parsed = JSON.parse(rawBody.toString("utf8"));
+        if (parsed && typeof parsed === "object") {
+          if (typeof parsed.email === "string") parsed.email = cleanEmail(parsed.email);
+          if (typeof parsed.password === "string") parsed.password = cleanPass(parsed.password);
+          rawBody = Buffer.from(JSON.stringify(parsed), "utf8");
+        }
+      } catch {}
+    }
+
     const json = () => (rawBody.length ? JSON.parse(rawBody.toString("utf8")) : {});
+    const reqEnv = {
+      ...process.env,
+      NEON_AUTH_TRUSTED_ORIGIN: process.env.NEON_AUTH_TRUSTED_ORIGIN || requestOrigin,
+    };
 
     let result;
     try {
       const quoteSendMatch = url.pathname.match(/^\/api\/quotes\/([^/]+)\/send-email$/);
-      if (url.pathname === "/api/quotes/company-settings") {
-        result = await handleCompanyQuoteSettings({
-          method: req.method || "GET",
-          headers: req.headers,
-          env: process.env,
-          database: db,
-          json,
-        });
-      } else if (url.pathname === "/api/quotes/cc-settings") {
-        result = await handleQuoteCcSettings({
-          method: req.method || "GET",
-          headers: req.headers,
-          env: process.env,
-          database: db,
-          json,
-        });
+      if (url.pathname === "/api/quotes/cc-settings") {
+        result = await handleQuoteCcSettings({ method: req.method || "GET", headers: req.headers, env: reqEnv, json });
       } else if (quoteSendMatch && req.method === "POST") {
-        result = await handleSendQuoteEmailWithCc({
-          headers: req.headers,
-          env: process.env,
-          database: db,
-          body: json(),
-          id: quoteSendMatch[1],
-        });
+        result = await handleSendQuoteWithCc({ headers: req.headers, env: reqEnv, body: json(), id: quoteSendMatch[1] });
+      } else if (url.pathname === "/api/auth/forgot-password" && req.method === "POST") {
+        result = await handleForgotPasswordCustom(reqEnv, json());
+      } else if (url.pathname === "/api/admin/reset-password" && req.method === "POST") {
+        result = await handleAdminResetCustom({ headers: req.headers, env: reqEnv, body: json() });
       } else {
         result = await handler({
           method: req.method || "GET",
@@ -776,16 +478,16 @@ const server = http.createServer(async (req, res) => {
           headers: req.headers,
           rawBody,
           json,
-          env: process.env,
+          env: reqEnv,
           db,
         });
+        if (url.pathname === "/api/auth/sign-in/email" && result.status !== 200) {
+          console.error("[auth] sign-in rejected:", result.status, String(result.body || "").slice(0, 300));
+        }
       }
     } catch (err) {
-      console.error("[server] unhandled api error", err?.message || err);
-      result = {
-        status: 500,
-        body: { ok: false, error: "server", message: "אירעה שגיאה בשרת — נסה שוב" },
-      };
+      console.error("[server] api error:", err?.message || err);
+      result = { status: 500, body: { ok: false, error: "server", message: "אירעה שגיאה בשרת — נסה שוב" } };
     }
 
     const outHeaders = { ...(result.headers || {}) };
@@ -801,3 +503,19 @@ const server = http.createServer(async (req, res) => {
   let filePath = path.join(distDir, url.pathname === "/" ? "index.html" : url.pathname);
   if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
     filePath = path.join(distDir, "index.html");
+  }
+  if (!fs.existsSync(filePath)) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Build dist/ not found. Run pnpm build first.");
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, { "content-type": MIME_TYPES[ext] || "application/octet-stream" });
+  fs.createReadStream(filePath).pipe(res);
+});
+
+const port = Number(process.env.PORT || 3000);
+server.listen(port, () => {
+  console.log(`Nes Multimedia server running on port ${port}`);
+  bootstrapAuthPermissions();
+});
