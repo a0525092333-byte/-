@@ -20,7 +20,6 @@ import {
   Wallet,
   type LucideIcon,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { site } from "@/content/site";
 import { useProfiles } from "@/hooks/use-data";
 import { ROLE_LABELS } from "@/lib/permissions";
@@ -30,7 +29,6 @@ import type { Module, Profile } from "@/lib/types";
 import { Avatar } from "@/components/shared";
 import { Sheet } from "@/components/ui/overlay";
 import { Button } from "@/components/ui/button";
-import { OfficeWindow } from "@/components/office/office-window";
 
 const ICONS: Record<string, LucideIcon> = {
   dashboard: LayoutDashboard,
@@ -60,6 +58,21 @@ const RESTRICTED_LABELS: Record<string, string> = {
   "/my-documents": "המסמכים שלי",
   "/crew": "הכרטיס שלי",
 };
+
+function openOfficeBrowserWindow() {
+  const width = Math.min(1440, Math.max(960, window.screen.availWidth - 80));
+  const height = Math.min(920, Math.max(700, window.screen.availHeight - 80));
+  const left = Math.max(0, Math.round((window.screen.availWidth - width) / 2));
+  const top = Math.max(0, Math.round((window.screen.availHeight - height) / 2));
+  const popup = window.open(
+    "/office",
+    "nsmm-office-window",
+    `popup=yes,noopener,noreferrer,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`,
+  );
+  if (!popup) {
+    window.open("/office", "_blank", "noopener,noreferrer");
+  }
+}
 
 function useVisibleNav(
   can: (m: Module, a?: "view" | "edit") => boolean,
@@ -158,7 +171,6 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = React.useState(false);
-  const [officeOpen, setOfficeOpen] = React.useState(false);
   const navigate = useNavigate();
   const fullScope = isFullScope(profile, isAdmin);
   const canSearch = can("search");
@@ -221,7 +233,7 @@ export function AppShell({
 
   const logout = () => {
     onLogout();
-            navigate({ to: "/login", search: { invite: undefined } });
+    navigate({ to: "/login", search: { invite: undefined } });
   };
 
   return (
@@ -249,7 +261,7 @@ export function AppShell({
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2" aria-label="ניווט ראשי">
           {nav.map((item) =>
             item.to === "/office" ? (
-              <NavButton key={item.to} item={item} onActivate={() => setOfficeOpen(true)} />
+              <NavButton key={item.to} item={item} onActivate={openOfficeBrowserWindow} />
             ) : (
               <NavLink key={item.to} item={item} badge={item.to === "/users" ? pendingCount : undefined} />
             ),
@@ -328,7 +340,7 @@ export function AppShell({
                 <button
                   key={item.to}
                   type="button"
-                  onClick={() => setOfficeOpen(true)}
+                  onClick={openOfficeBrowserWindow}
                   className="flex min-h-14 min-w-0 flex-1 flex-col items-center justify-center gap-0.5 px-0.5 text-[10px] font-medium leading-tight text-muted-foreground"
                 >
                   <Icon className="size-5 shrink-0" aria-hidden="true" />
@@ -369,7 +381,7 @@ export function AppShell({
                 item={item}
                 onActivate={() => {
                   setMoreOpen(false);
-                  setOfficeOpen(true);
+                  openOfficeBrowserWindow();
                 }}
               />
             ) : (
@@ -397,8 +409,6 @@ export function AppShell({
           </Button>
         </div>
       </Sheet>
-
-      {officeOpen ? <OfficeWindow open onClose={() => setOfficeOpen(false)} /> : null}
     </div>
   );
 }
