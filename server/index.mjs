@@ -577,14 +577,26 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
 
   const quote = (await db.query(`SELECT * FROM public.quotes WHERE id = $1`, [id]))[0];
   if (!quote) return { status: 404, body: { ok: false, message: "ההצעה לא נמצאה" } };
-  const [items, imageRows, settingsRows, eventRows] = await Promise.all([
+  cconst [items, imageRows, settingsRows, eventRows] = await Promise.all([
     db.query(`SELECT * FROM public.quote_items WHERE quote_id = $1 ORDER BY sort_order ASC, created_at ASC`, [id]),
     db.query(`SELECT position, mime, data_url, caption FROM public.quote_images WHERE quote_id = $1 ORDER BY position ASC, id ASC`, [id]),
     db.query(`SELECT company_name, tax_id, address, phone, email, logo_url FROM public.company_settings WHERE id = 1`),
-    quote.event_id ? db.query(`SELECT address FROM public.events WHERE id = $1`, [quote.event_id]) : Promise.resolve([]),
+    quote.event_id ? db.query(`SELECT address, venue, event_date, start_date FROM public.events WHERE id = $1`, [quote.event_id]) : Promise.resolve([]),
   ]);
   const settings = settingsRows[0] || {};
-  const eventAddress = (quote.event_address && String(quote.event_address).trim()) || eventRows[0]?.address || null;
+  const linkedEvent = eventRows[0] || {};
+  const eventAddress = (quote.event_address && String(quote.event_address).trim()) || linkedEvent.address || null;
+
+  const rawClient = String(quote.client_name || "").trim();
+  const rawDate = String(quote.event_date || linkedEvent.event_date || linkedEvent.start_date || "").slice(0, 10);
+  const formattedDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+    ? `${rawDate.slice(8, 10)}.${rawDate.slice(5, 7)}.${rawDate.slice(0, 4)}`
+    : "";
+  const rawVenue = String(quote.venue || linkedEvent.venue || "").trim();
+  const safeParts = [rawClient, formattedDate, rawVenue]
+    .map((p) => p.replace(/[\\/:*?"<>|\u0000-\u001F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const pdfFileName = `${safeParts.length ? safeParts.join(" ") : `הצעת-מחיר-${quote.quote_number}`}.pdf`;
 
   let customLogo;
   if (settings.logo_url) {
@@ -620,7 +632,7 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
       reply_to: replyTo,
       subject: `הצעת מחיר מס׳ ${quote.quote_number} — ${settings.company_name || "נס מולטימדיה"}`,
       html,
-      attachments: [{ filename: `הצעת-מחיר-${quote.quote_number}.pdf`, content: pdf.toString("base64") }],
+      attachments: [{ filename: pdfFileName, content: pdf.toString("base64") }],
     }),
   });
   if (!res.ok) {
@@ -629,7 +641,6 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
   }
   await db.query(`UPDATE public.quotes SET last_sent_at = now(), last_sent_to = $1 WHERE id = $2`, [[to, ...ccList].join(", "), id]).catch(() => {});
   return { status: 200, body: { ok: true, to, cc: ccList } };
-}
 
 async function bootstrapAuthPermissions() {
   try {
