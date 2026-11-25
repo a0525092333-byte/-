@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { Copy, History, KeyRound, Mail, MailPlus, Search, Settings, UserCog, X } from "lucide-react";
+import { Copy, History, KeyRound, Mail, MailPlus, Search, Settings, Trash2, UserCog, X } from "lucide-react";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/use-session";
 import { useAllPermissions, useInvites, usePasswordResets, useProfiles } from "@/hooks/use-data";
-import { db } from "@/integrations/neon/client";
+import { db, dataApiToken } from "@/integrations/neon/client";
+import { currentUser, getAccessToken, refreshSession } from "@/integrations/neon/auth";
 import { sendInviteEmail } from "@/lib/invites";
 import { sendTestEmail } from "@/lib/password-reset";
 import { MODULES, ROLE_LABELS, ROLE_OPTIONS, presetRows } from "@/lib/permissions";
@@ -21,6 +22,8 @@ import { passwordResetContent } from "@/content/users";
 import type { Invite, Module, Profile, Role, UserPermission } from "@/lib/types";
 
 export const Route = createFileRoute("/_app/users")({ component: UsersPage });
+
+const OWNER_EMAIL = "a0525092333@gmail.com";
 
 function HourlyRateField({ profile, onSave }: { profile: Profile; onSave: (value: number | null) => Promise<void> }) {
   const [value, setValue] = useState(profile.hourly_rate != null ? String(profile.hourly_rate) : "");
@@ -72,6 +75,7 @@ function UsersPage() {
   const canManageUsers = can("users", "edit");
   const securityAccess = useSecurityAccess();
   const canManagePermissions = canManageUsers && securityAccess.canReset;
+  const canDeleteUsers = Boolean(user?.id) && (isSuperAdmin || effectiveRole === "admin");
   const profilesQ = useProfiles(canUsers);
   const permsQ = useAllPermissions(canUsers);
   const invitesQ = useInvites(canUsers);
@@ -88,6 +92,9 @@ function UsersPage() {
   const [resetOpen, setResetOpen] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
   const [settingsTarget, setSettingsTarget] = useState<Profile | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [invitesOpen, setInvitesOpen] = useState(false);
   const [testOpen, setTestOpen] = useState(false);
@@ -99,7 +106,6 @@ function UsersPage() {
   const allPerms = permsQ.data ?? [];
   const invites = invitesQ.data ?? [];
   const resets = resetsQ.data ?? [];
-  const pendingProfiles = profiles.filter((profile) => profile.approval_status === "pending");
   const pendingInvitesCount = invites.filter((invite) => invite.status === "pending").length;
 
   const filtered = useMemo(() => {
@@ -125,6 +131,80 @@ function UsersPage() {
 
   function permsFor(userId: string): UserPermission[] {
     return allPerms.filter((p) => p.user_id === userId);
+  }
+
+  function canDeleteProfile(profile: Profile): boolean {
+    if (!canDeleteUsers) return false;
+    if (profile.id === user?.id) return false;
+    if (profile.email.trim().toLowerCase() === OWNER_EMAIL) return false;
+    if (!isSuperAdmin && profile.role === "admin") return false;
+    return true;
+  }
+
+  function openDeleteDialog(profile: Profile) {
+    if (!canDeleteProfile(profile)) return;
+    setDeleteConfirmText("");
+    setDeleteTarget(profile);
+  }
+
+  async function resolveAuthToken(): Promise<string | null> {
+    let token = await getAccessToken().catch(() => null);
+    if (!token && !currentUser()) {
+      await refreshSession().catch(() => null);
+      token = await getAccessToken().catch(() => null);
+    }
+    return token ?? (await dataApiToken().catch(() => null));
+  }
+
+  async function confirmDeleteUser() {
+    if (!deleteTarget || !canDeleteProfile(deleteTarget)) return;
+    const expected = deleteTarget.email.trim().toLowerCase();
+    if (deleteConfirmText.trim().toLowerCase() !== expected) {
+      toast.error("נא להקליד את כתובת האימייל של המשתמש לאישור המחיקה");
+      return;
+    }
+
+    setDeleteBusy(true);
+    try {
+      const token = await resolveAuthToken();
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        accept: "application/json",
+      };
+      if (token) headers.authorization = `Bearer ${token}`;
+
+      const res = await fetch("/api/admin/delete-user", {
+        method: "POST",
+        headers,
+        credentials: "include",
+        body: JSON.stringify({ user_id: deleteTarget.id }),
+      });
+      const text = await res.text();
+      let payload: { ok?: boolean; message?: string } | null = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        payload = null;
+      }
+
+      if (!res.ok || payload?.ok === false) {
+        toast.error(payload?.message || `מחיקת המשתמש נכשלה (HTTP ${res.status})`);
+        return;
+      }
+
+      toast.success(`המשתמש ${deleteTarget.full_name} נמחק בהצלחה`);
+      const deletedId = deleteTarget.id;
+      setDeleteTarget(null);
+      setDeleteConfirmText("");
+      if (settingsTarget?.id === deletedId) setSettingsTarget(null);
+      profilesQ.refetch();
+      permsQ.refetch();
+      invitesQ.refetch();
+    } catch {
+      toast.error("לא הצלחנו להגיע לשרת — בדוק את החיבור ונסה שוב");
+    } finally {
+      setDeleteBusy(false);
+    }
   }
 
   async function changeRole(profile: Profile, role: Role) {
@@ -430,6 +510,22 @@ function UsersPage() {
                   <Settings className="size-4" />
                   הגדרות
                 </Button>
+                {canDeleteProfile(profile) ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="shrink-0 text-red-700 hover:bg-red-50 hover:text-red-800"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openDeleteDialog(profile);
+                    }}
+                    aria-label={`מחיקת משתמש ${profile.full_name}`}
+                  >
+                    <Trash2 className="size-4" />
+                    מחיקה
+                  </Button>
+                ) : null}
               </div>
             );
           })}
@@ -695,9 +791,85 @@ function UsersPage() {
                   {passwordResetContent.button}
                 </Button>
               </div>
+              {canDeleteProfile(profile) ? (
+                <div className="flex flex-col justify-between gap-3 rounded-xl border border-red-200 bg-red-50/50 p-3 sm:flex-row sm:items-center">
+                  <div>
+                    <p className="text-sm font-medium text-red-900">מחיקת משתמש מהמערכת</p>
+                    <p className="mt-0.5 text-xs text-red-700">
+                      הסרת החשבון וההרשאות לצמיתות וניתוק סשנים פעילים. נתוני אירועים והצעות מחיר נשמרים.
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="shrink-0 border-red-300 text-red-700 hover:bg-red-100 hover:text-red-900"
+                    onClick={() => openDeleteDialog(profile)}
+                  >
+                    <Trash2 className="size-4" />
+                    מחיקת משתמש
+                  </Button>
+                </div>
+              ) : null}
             </div>
           );
         })() : null}
+      </Dialog>
+
+      <Dialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => {
+          if (!open && !deleteBusy) {
+            setDeleteTarget(null);
+            setDeleteConfirmText("");
+          }
+        }}
+        title="אישור מחיקת משתמש"
+        description={deleteTarget ? `${deleteTarget.full_name} (${deleteTarget.email})` : undefined}
+        size="sm"
+      >
+        {deleteTarget ? (
+          <div className="space-y-4">
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              פעולה זו מוחקת את חשבון המשתמש, הרשאותיו והסשנים הפעילים שלו מ-Neon, ומשחררת קישור לצוות שטח ללא מחיקת אירועים או הצעות מחיר קיימות.
+            </p>
+            <div>
+              <label htmlFor="confirm-delete-email" className="mb-1 block text-xs font-medium text-foreground">
+                להמשך המחיקה, הקלד את האימייל של המשתמש: <span dir="ltr" className="font-mono">{deleteTarget.email}</span>
+              </label>
+              <Input
+                id="confirm-delete-email"
+                dir="ltr"
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                placeholder={deleteTarget.email}
+                className="h-11 text-start"
+                disabled={deleteBusy}
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setDeleteTarget(null);
+                  setDeleteConfirmText("");
+                }}
+                disabled={deleteBusy}
+              >
+                ביטול
+              </Button>
+              <Button
+                type="button"
+                onClick={confirmDeleteUser}
+                disabled={deleteBusy || deleteConfirmText.trim().toLowerCase() !== deleteTarget.email.trim().toLowerCase()}
+                className="bg-red-700 text-white hover:bg-red-800"
+              >
+                <Trash2 className="size-4" />
+                {deleteBusy ? "מוחק…" : "אישור מחיקה"}
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </Dialog>
 
       <PasswordResetDialog
