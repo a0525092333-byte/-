@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { ArrowRight, CalendarPlus, Copy, ExternalLink, FileText, Mail, Pencil, Printer } from "lucide-react";
 import { toast } from "sonner";
@@ -27,9 +27,30 @@ import { PaperlessIssueDialog } from "@/components/quotes/paperless-issue-dialog
 
 export const Route = createFileRoute("/_app/quotes/$id_/print")({ component: QuotePrintPage });
 
+function buildQuoteFileTitle(
+  clientName?: string | null,
+  eventDate?: string | null,
+  venue?: string | null,
+  quoteNumber?: string | null,
+): string {
+  const isoDate = String(eventDate ?? "").slice(0, 10);
+  const formattedDate = /^\d{4}-\d{2}-\d{2}$/.test(isoDate)
+    ? `${isoDate.slice(8, 10)}.${isoDate.slice(5, 7)}.${isoDate.slice(0, 4)}`
+    : "";
+  const parts = [clientName, formattedDate, venue]
+    .map((part) =>
+      String(part ?? "")
+        .replace(/[\\/:*?"<>|\u0000-\u001F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    )
+    .filter(Boolean);
+  return parts.length ? parts.join(" ") : `הצעת-מחיר-${quoteNumber || "quote"}`;
+}
+
 function QuotePrintPage() {
   const { id } = Route.useParams();
-  const { user, profile, can, isAdmin } = useSession();
+  const { user, profile, can } = useSession();
   const navigate = useNavigate();
   const canView = can("quotes");
   const canEdit = can("quotes", "edit");
@@ -55,6 +76,22 @@ function QuotePrintPage() {
   const client = (clientsQ.data ?? []).find((c) => c.id === quote?.client_id) ?? null;
   const event = (eventsQ.data ?? []).find((e) => e.id === quote?.event_id) ?? null;
   const eventAddress = quote?.event_address?.trim() || event?.address || null;
+  const resolvedEventDate =
+    quote?.event_date || (event as { event_date?: string | null; start_date?: string | null } | null)?.event_date || (event as { start_date?: string | null } | null)?.start_date || null;
+  const resolvedVenue = quote?.venue?.trim() || (event as { venue?: string | null } | null)?.venue || null;
+  const pdfFileTitle = useMemo(
+    () => (quote ? buildQuoteFileTitle(quote.client_name, resolvedEventDate, resolvedVenue, quote.quote_number) : ""),
+    [quote, resolvedEventDate, resolvedVenue],
+  );
+
+  useEffect(() => {
+    if (!pdfFileTitle) return;
+    const prevTitle = document.title;
+    document.title = pdfFileTitle;
+    return () => {
+      document.title = prevTitle;
+    };
+  }, [pdfFileTitle]);
 
   const totals = useMemo(
     () =>
@@ -87,6 +124,15 @@ function QuotePrintPage() {
     );
   }
   if (!quote) return <ErrorState message="ההצעה לא נמצאה." onRetry={() => quoteQ.refetch()} />;
+
+  function handlePrintPdf() {
+    const prevTitle = document.title;
+    document.title = pdfFileTitle;
+    window.print();
+    window.setTimeout(() => {
+      document.title = prevTitle;
+    }, 1000);
+  }
 
   async function duplicateQuote() {
     if (!quote) return;
@@ -233,7 +279,7 @@ function QuotePrintPage() {
               </a>
             </Button>
           ) : null}
-          <Button type="button" variant="outline" onClick={() => window.print()}>
+          <Button type="button" variant="outline" onClick={handlePrintPdf}>
             <Printer className="size-4" /> הדפסה / PDF
           </Button>
           {canEdit ? (
