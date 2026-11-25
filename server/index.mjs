@@ -417,7 +417,7 @@ async function bootstrapAuthPermissions() {
   }
 }
 
-const MIME_TYPES = {
+
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
