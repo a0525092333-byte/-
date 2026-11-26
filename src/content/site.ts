@@ -8,7 +8,7 @@ export const site = {
   nav: [
     { label: "סקירה", to: "/", module: "dashboard", icon: "dashboard" },
     { label: "יומן", to: "/calendar", module: "calendar", icon: "calendar" },
-    { label: "מצב משרד", to: "/office", module: "office", icon: "office" },
+    { label: "לוח תפעול ושיבוץ", to: "/office", module: "office", icon: "office" },
     { label: "אירועים", to: "/events", module: "clients", icon: "events" },
     { label: "לקוחות", to: "/clients", module: "clients", icon: "clients" },
     { label: "כספים", to: "/finance", module: "finance", icon: "finance" },
@@ -24,3 +24,4 @@ export const site = {
 } as const;
 
 export type NavItem = (typeof site.nav)[number];
+// END OF FILE - src/content/site.ts
