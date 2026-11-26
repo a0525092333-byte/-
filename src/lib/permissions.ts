@@ -9,7 +9,7 @@ export const MODULES: { key: Module; label: string; description: string }[] = [
   { key: "users", label: "ניהול משתמשים", description: "תפקידים והרשאות" },
   { key: "attendance", label: "שעון נוכחות", description: "דיווח שעות, תוספות ונסיעות" },
   { key: "quotes", label: "הצעות מחיר", description: "בניית הצעות מחיר, מחירון והדפסה" },
-  { key: "office", label: "מצב משרד", description: "יומן שבועי ושיבוץ צוות מול האירועים" },
+  { key: "office", label: "לוח תפעול ושיבוץ", description: "לוח שיבוץ משימות, רכבים, זמינות צוות והודעות וואטסאפ" },
   { key: "backup", label: "גיבוי ושחזור", description: "ייצוא, שחזור וגיבוי אוטומטי" },
   { key: "search", label: "חיפוש חכם", description: "חיפוש גלובלי בכל סוגי התוכן" },
 ];
@@ -81,7 +81,7 @@ export const ROLE_PRESETS: Record<Role, Preset> = {
     users: { view: false, edit: false },
     attendance: { view: false, edit: false },
     quotes: { view: false, edit: false },
-    office: { view: false, edit: false },
+    office: { view: true, edit: false },
     backup: { view: false, edit: false },
     search: { view: false, edit: false },
   },
@@ -89,12 +89,12 @@ export const ROLE_PRESETS: Record<Role, Preset> = {
     calendar: { view: true, edit: false },
     clients: { view: false, edit: false },
     finance: { view: false, edit: false },
-    crew: { view: false, edit: false },
-    equipment: { view: true, edit: false },
+    crew: { view: true, edit: false },
+    equipment: { view: true, edit: true },
     users: { view: false, edit: false },
     attendance: { view: false, edit: false },
     quotes: { view: false, edit: false },
-    office: { view: false, edit: false },
+    office: { view: true, edit: true },
     backup: { view: false, edit: false },
     search: { view: false, edit: false },
   },
@@ -102,21 +102,19 @@ export const ROLE_PRESETS: Record<Role, Preset> = {
 
 export const SUPER_ADMIN_EMAIL = "a0525092333@gmail.com";
 
-/** Shown when anyone but the account owner tries to delete an event. */
 export const EVENT_DELETE_OWNER_ONLY_MESSAGE = "רק בעל החשבון יכול למחוק אירועים";
 
-/** The owner account keeps unlimited access so the app can never lock itself out. */
 export function isSuperAdmin(email: string | null | undefined): boolean {
   return (email ?? "").trim().toLowerCase() === SUPER_ADMIN_EMAIL;
 }
 
 export function can(
   perms: UserPermission[] | undefined,
-  isSuperAdmin: boolean,
+  isSuperAdminFlag: boolean,
   module: Module,
   action: "view" | "edit" = "view",
 ): boolean {
-  if (isSuperAdmin) return true;
+  if (isSuperAdminFlag) return true;
   const row = (perms ?? []).find((p) => p.module === module);
   if (!row) return false;
   return action === "edit" ? !!row.can_edit : !!row.can_view || !!row.can_edit;
@@ -124,18 +122,18 @@ export function can(
 
 export function canView(
   perms: UserPermission[] | undefined,
-  isSuperAdmin: boolean,
+  isSuperAdminFlag: boolean,
   module: Module,
 ): boolean {
-  return can(perms, isSuperAdmin, module, "view");
+  return can(perms, isSuperAdminFlag, module, "view");
 }
 
 export function canEdit(
   perms: UserPermission[] | undefined,
-  isSuperAdmin: boolean,
+  isSuperAdminFlag: boolean,
   module: Module,
 ): boolean {
-  return can(perms, isSuperAdmin, module, "edit");
+  return can(perms, isSuperAdminFlag, module, "edit");
 }
 
 const PATH_MODULES: { prefix: string; module: Module }[] = [
@@ -154,41 +152,41 @@ const PATH_MODULES: { prefix: string; module: Module }[] = [
   { prefix: "/search", module: "search" },
 ];
 
-/** Route guard: a module URL is allowed only when the matrix grants view. */
 export function canAccessPath(
   pathname: string,
-  can: (module: Module, action?: "view" | "edit") => boolean,
+  canFn: (module: Module, action?: "view" | "edit") => boolean,
 ): boolean {
   if (pathname === "/" || pathname === "/settings" || pathname.startsWith("/settings/")) return true;
+  if (pathname === "/office" || pathname.startsWith("/office/")) {
+    return canFn("office", "view") || canFn("crew", "view") || canFn("calendar", "view") || canFn("attendance", "view");
+  }
   if (pathname === "/events" || pathname.startsWith("/events/")) {
-    return (["clients", "calendar", "crew", "finance", "equipment"] as Module[]).some((m) => can(m, "view"));
+    return (["clients", "calendar", "crew", "finance", "equipment", "office"] as Module[]).some((m) => canFn(m, "view"));
   }
   const match = PATH_MODULES.find(
     (entry) => pathname === entry.prefix || pathname.startsWith(`${entry.prefix}/`),
   );
-  return match ? can(match.module, "view") : true;
+  return match ? canFn(match.module, "view") : true;
 }
-
 
 const HOME_PRIORITY: { path: string; module: Module }[] = [
   { path: "/calendar", module: "calendar" },
   { path: "/attendance", module: "attendance" },
+  { path: "/office", module: "office" },
   { path: "/clients", module: "clients" },
   { path: "/quotes", module: "quotes" },
   { path: "/finance", module: "finance" },
   { path: "/crew", module: "crew" },
   { path: "/equipment", module: "equipment" },
-  { path: "/office", module: "office" },
   { path: "/search", module: "search" },
   { path: "/backup", module: "backup" },
   { path: "/users", module: "users" },
 ];
 
-/** First module the user may view; "/" renders the no-permission screen. */
 export function firstAllowedPath(
-  can: (module: Module, action?: "view" | "edit") => boolean,
+  canFn: (module: Module, action?: "view" | "edit") => boolean,
 ): string {
-  const hit = HOME_PRIORITY.find((entry) => can(entry.module, "view"));
+  const hit = HOME_PRIORITY.find((entry) => canFn(entry.module, "view"));
   return hit ? hit.path : "/";
 }
 
@@ -200,3 +198,4 @@ export function presetRows(role: Role): { module: Module; can_view: boolean; can
     can_edit: preset[m.key].edit,
   }));
 }
+// END OF FILE - src/lib/permissions.ts
