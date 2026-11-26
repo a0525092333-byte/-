@@ -9,6 +9,7 @@ export type Profile = {
   role: Role;
   is_active: boolean;
   hourly_rate: number | null;
+  km_rate?: number | null;
   created_at: string;
   approval_status: "pending" | "approved" | "rejected";
   approved_at: string | null;
@@ -217,6 +218,7 @@ export type TimeEntry = {
   shift_type: ShiftType;
   travel_km: number;
   travel_amount: number;
+  travel_route?: string | null;
   event_id: string | null;
   note: string | null;
   status: EntryStatus;
@@ -364,6 +366,7 @@ export type CompanySettings = {
   phone: string | null;
   email: string | null;
   default_vat_rate: number;
+  default_km_rate?: number | null;
   default_terms: string[];
   default_terms_text: string | null;
   default_notes: string | null;
@@ -437,3 +440,64 @@ export type EventDayCrew = {
   notes: string | null;
   created_at: string;
 };
+
+export type DispatchTaskType = "setup" | "operation" | "sub_zone" | "teardown" | "rollover";
+
+export type CompanyVehicle = {
+  id: string;
+  name: string;
+  vehicle_type: string;
+  sort_order: number;
+  is_active: boolean;
+  notes: string | null;
+  created_at: string;
+};
+
+export type DispatchTask = {
+  id: string;
+  event_id: string | null;
+  rollover_to_event_id: string | null;
+  task_date: string;
+  task_type: DispatchTaskType;
+  title_override: string | null;
+  sub_location: string | null;
+  warehouse_time: string | null;
+  start_time: string | null;
+  end_time: string | null;
+  vehicle_id: string | null;
+  extra_vehicle_ids: string[];
+  route_group_id: string | null;
+  route_order: number;
+  equipment_notes: string | null;
+  ops_notes: string | null;
+  sort_order: number;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DispatchTaskCrew = {
+  id: string;
+  task_id: string;
+  crew_member_id: string;
+  task_roles: string[];
+  uses_personal_car: boolean;
+  assigned_vehicle_id: string | null;
+  rides_with_member_id: string | null;
+  personal_note: string | null;
+  whatsapp_sent_at: string | null;
+  created_at: string;
+};
+
+export type CrewUnavailability = {
+  id: string;
+  crew_member_id: string;
+  unavailable_date: string;
+  all_day: boolean;
+  from_time: string | null;
+  to_time: string | null;
+  reason: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+// END OF FILE - src/lib/types.ts
