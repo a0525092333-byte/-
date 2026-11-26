@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Ban, CalendarDays, Car, Check, Copy, FileText, MessageCircle, Trash2, Truck } from "lucide-react";
+import { Ban, CalendarDays, Camera, Car, Check, Copy, FileText, MessageCircle, PackagePlus, Trash2, Truck } from "lucide-react";
 import { toast } from "sonner";
 import { db } from "@/integrations/neon/client";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { Checkbox, Field } from "@/components/ui/controls";
 import { Dialog } from "@/components/ui/overlay";
 import { EmptyState } from "@/components/shared";
 import { dateShort, timeShort, todayISO, weekdayShort } from "@/lib/format";
+import { CHANGE_TYPE_META } from "@/lib/event-report";
 import type {
   CompanyVehicle,
   CrewMember,
@@ -16,6 +17,7 @@ import type {
   DispatchTask,
   DispatchTaskCrew,
   DispatchTaskType,
+  EquipmentChangeType,
   EventRow,
 } from "@/lib/types";
 
@@ -177,6 +179,128 @@ export function buildWorkerDayWhatsappMessage({
     lines.push("");
   });
   return lines.join("\n").trim();
+}
+
+export function EquipmentChangeDialog({
+  open,
+  onOpenChange,
+  eventId,
+  eventTitle,
+  source,
+  userId,
+  userName,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  eventId: string | null;
+  eventTitle?: string | null;
+  source: "warehouse" | "field";
+  userId?: string | null;
+  userName?: string | null;
+  onSaved: () => void;
+}) {
+  const [changeType, setChangeType] = useState<EquipmentChangeType>("add");
+  const [itemName, setItemName] = useState("");
+  const [qty, setQty] = useState("1");
+  const [unit, setUnit] = useState("יח׳");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    if (!eventId) {
+      toast.error("נא לבחור אירוע תחילה");
+      return;
+    }
+    if (!itemName.trim()) {
+      toast.error("נא להזין את שם הפריט שהשתנה");
+      return;
+    }
+    setBusy(true);
+    const { error } = await db.from("event_equipment_changes").insert({
+      id: crypto.randomUUID(),
+      event_id: eventId,
+      change_type: changeType,
+      item_name: itemName.trim(),
+      quantity: Math.max(0.5, Number(qty) || 1),
+      unit: unit.trim() || null,
+      reason: reason.trim() || null,
+      source,
+      status: "pending",
+      reported_by: userId ?? null,
+      reported_by_name: userName ?? null,
+    });
+    setBusy(false);
+    if (error) {
+      toast.error("לא הצלחנו לשמור את שינוי הציוד — ודא שהרצת את ה-SQL של שלב ב׳ ב-Neon");
+      return;
+    }
+    toast.success("שינוי הציוד עודכן בדוח האירוע ונשלחה התראה למשרד לעדכון ההצעה");
+    setItemName("");
+    setQty("1");
+    setReason("");
+    onOpenChange(false);
+    onSaved();
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => { if (!busy) onOpenChange(v); }}
+      title={`עדכון מפרט ציוד (+/-)${eventTitle ? ` — ${eventTitle}` : ""}`}
+      description="מעדכן מיד את דוח הציוד של הצוות בשטח ושולח התראה לסוכן המכירות / מנהל לעדכון הצעת המחיר"
+      size="sm"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>ביטול</Button>
+          <Button type="button" onClick={save} disabled={busy}>{busy ? "שומר…" : "שמירה והתראה למשרד"}</Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <div className="grid grid-cols-3 gap-1.5">
+          {(["add", "remove", "swap"] as EquipmentChangeType[]).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setChangeType(t)}
+              className={`rounded-lg border px-2 py-2 text-xs font-bold ${
+                changeType === t ? `${CHANGE_TYPE_META[t].tone} ring-2 ring-primary/30` : "border-border bg-background text-muted-foreground"
+              }`}
+            >
+              {CHANGE_TYPE_META[t].label}
+            </button>
+          ))}
+        </div>
+        <Field label="שם הפריט *" htmlFor="eq-chg-name">
+          <Input
+            id="eq-chg-name"
+            value={itemName}
+            onChange={(e) => setItemName(e.target.value)}
+            placeholder="לדוגמה: מדונה אלחוטית / מוניטור במה / מסך לד"
+            className="h-10"
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="כמות" htmlFor="eq-chg-qty">
+            <Input id="eq-chg-qty" type="number" min="0.5" step="0.5" value={qty} onChange={(e) => setQty(e.target.value)} className="h-10" />
+          </Field>
+          <Field label="יחידה" htmlFor="eq-chg-unit">
+            <Input id="eq-chg-unit" value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="יח׳ / מ״ר / סט" className="h-10" />
+          </Field>
+        </div>
+        <Field label="סיבת השינוי / מי ביקש" htmlFor="eq-chg-reason">
+          <Input
+            id="eq-chg-reason"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="לדוגמה: סיכום טלפוני נוסף עם הלקוח / תוספת בשטח"
+            className="h-10"
+          />
+        </Field>
+      </div>
+    </Dialog>
+  );
 }
 
 export function UnavailabilityDialog({
@@ -451,6 +575,7 @@ export function CrewSelfServiceView({
   crewMap,
   vehicleMap,
   userId,
+  userName,
   onRefresh,
 }: {
   myMember: CrewMember | null;
@@ -461,9 +586,11 @@ export function CrewSelfServiceView({
   crewMap: Map<string, CrewMember>;
   vehicleMap: Map<string, CompanyVehicle>;
   userId?: string | null;
+  userName?: string | null;
   onRefresh: () => void;
 }) {
   const [unavailOpen, setUnavailOpen] = useState(false);
+  const [eqChangeTarget, setEqChangeTarget] = useState<{ id: string; title: string } | null>(null);
   const today = todayISO();
 
   const crewByTask = useMemo(() => {
@@ -522,7 +649,7 @@ export function CrewSelfServiceView({
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card p-4">
         <div>
           <h1 className="text-lg font-bold text-foreground">הסידור והזמינות שלי — {myMember.full_name}</h1>
-          <p className="text-xs text-muted-foreground">כל ההקמות, ההפעלות, הרכבים והתפקידים שלך לימים הקרובים</p>
+          <p className="text-xs text-muted-foreground">כל ההקמות, ההפעלות, הרכבים, התמונות מהשטח והתפקידים שלך</p>
         </div>
         <Button type="button" variant="outline" onClick={() => setUnavailOpen(true)}>
           <Ban className="size-4 text-red-600" /> עדכון אי-זמינות / חופש
@@ -558,6 +685,7 @@ export function CrewSelfServiceView({
             const tc = crewByTask.get(task.id) ?? [];
             const mine = tc.find((c) => c.crew_member_id === myMember.id)!;
             const rideText = describeRideForMember(mine, tc, task, crewMap, vehicleMap);
+            const title = taskDisplayTitle(task, eventsMap);
             const teammates = tc
               .filter((c) => c.crew_member_id !== myMember.id)
               .map((c) => crewMap.get(c.crew_member_id)?.full_name)
@@ -576,14 +704,25 @@ export function CrewSelfServiceView({
                       </span>
                     </div>
                     {task.event_id ? (
-                      <Button asChild size="sm" variant="outline" className="h-8 text-xs">
-                        <Link to="/events/$id/crew-sheet" params={{ id: task.event_id }}>
-                          <FileText className="size-3.5" /> דוח אירוע וסקיצות
-                        </Link>
-                      </Button>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-8 text-xs"
+                          onClick={() => setEqChangeTarget({ id: task.event_id!, title })}
+                        >
+                          <PackagePlus className="size-3.5 text-indigo-600" /> שינוי ציוד (+/-)
+                        </Button>
+                        <Button asChild size="sm" variant="outline" className="h-8 text-xs">
+                          <Link to="/events/$id/crew-sheet" params={{ id: task.event_id }}>
+                            <Camera className="size-3.5 text-emerald-600" /> דוח אירוע וצילום שטח
+                          </Link>
+                        </Button>
+                      </div>
                     ) : null}
                   </div>
-                  <p className="text-base font-bold text-foreground">{taskDisplayTitle(task, eventsMap)}</p>
+                  <p className="text-base font-bold text-foreground">{title}</p>
                   <p className="text-xs font-medium text-foreground">
                     {task.warehouse_time ? `התייצבות במחסן: ${timeShort(task.warehouse_time)} · ` : ""}
                     {task.start_time ? `התחלה: ${timeShort(task.start_time)}` : ""}
@@ -619,6 +758,17 @@ export function CrewSelfServiceView({
         crewMembers={[myMember]}
         fixedMemberId={myMember.id}
         userId={userId}
+        onSaved={onRefresh}
+      />
+
+      <EquipmentChangeDialog
+        open={!!eqChangeTarget}
+        onOpenChange={(v) => { if (!v) setEqChangeTarget(null); }}
+        eventId={eqChangeTarget?.id ?? null}
+        eventTitle={eqChangeTarget?.title}
+        source="field"
+        userId={userId}
+        userName={userName || myMember.full_name}
         onSaved={onRefresh}
       />
     </div>
