@@ -1,11 +1,15 @@
 import * as React from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Bell,
   Boxes,
   CalendarDays,
+  Check,
   ClipboardList,
   Clock,
   DatabaseBackup,
+  ExternalLink,
   FileText,
   HardHat,
   KeyRound,
@@ -21,14 +25,18 @@ import {
   Wallet,
   type LucideIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { site } from "@/content/site";
-import { useProfiles } from "@/hooks/use-data";
+import { useEvents, useProfiles, useQuotes } from "@/hooks/use-data";
+import { db } from "@/integrations/neon/client";
 import { ROLE_LABELS } from "@/lib/permissions";
 import { homeRouteFor } from "@/lib/roles";
 import { isFullScope } from "@/lib/scope";
-import type { Module, Profile } from "@/lib/types";
+import { dateShort, num } from "@/lib/format";
+import { CHANGE_TYPE_META } from "@/lib/event-report";
+import type { EquipmentChangeStatus, EventEquipmentChange, Module, Profile } from "@/lib/types";
 import { Avatar } from "@/components/shared";
-import { Sheet } from "@/components/ui/overlay";
+import { Dialog, Sheet } from "@/components/ui/overlay";
 import { Button } from "@/components/ui/button";
 
 const ICONS: Record<string, LucideIcon> = {
@@ -145,9 +153,12 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = React.useState(false);
+  const [alertsOpen, setAlertsOpen] = React.useState(false);
+  const [resolvingId, setResolvingId] = React.useState<string | null>(null);
   const [boardFullscreen, setBoardFullscreen] = React.useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const isDispatchRoute = location.pathname === "/office" || location.pathname.startsWith("/office/");
 
   React.useEffect(() => {
@@ -167,6 +178,61 @@ export function AppShell({
 
   const fullScope = isFullScope(profile, isAdmin);
   const canSearch = can("search");
+  const canHandleAlerts =
+    isSuperAdmin ||
+    isAdmin ||
+    (fullScope && (can("quotes", "edit") || can("finance", "edit") || can("clients", "edit")));
+
+  const pendingChangesQ = useQuery({
+    queryKey: ["pending_equipment_changes"],
+    enabled: canHandleAlerts,
+    refetchInterval: 30000,
+    queryFn: async () => {
+      const { data, error } = await db
+        .from<EventEquipmentChange[]>("event_equipment_changes")
+        .select("*")
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+      if (error) return [];
+      return data ?? [];
+    },
+  });
+  const alertEventsQ = useEvents(canHandleAlerts);
+  const alertQuotesQ = useQuotes(canHandleAlerts && can("quotes", "view"));
+
+  const pendingChanges = pendingChangesQ.data ?? [];
+  const alertEventsMap = React.useMemo(
+    () => new Map((alertEventsQ.data ?? []).map((e) => [e.id, e])),
+    [alertEventsQ.data],
+  );
+  const quotesByEvent = React.useMemo(() => {
+    const m = new Map<string, string>();
+    for (const q of alertQuotesQ.data ?? []) {
+      if (q.event_id && !m.has(q.event_id)) m.set(q.event_id, q.id);
+    }
+    return m;
+  }, [alertQuotesQ.data]);
+
+  async function resolveAlert(change: EventEquipmentChange, status: EquipmentChangeStatus) {
+    setResolvingId(change.id);
+    const { error } = await db
+      .from("event_equipment_changes")
+      .update({
+        status,
+        resolved_by: profile.id,
+        resolved_at: new Date().toISOString(),
+      })
+      .eq("id", change.id);
+    setResolvingId(null);
+    if (error) {
+      toast.error("לא הצלחנו לעדכן את סטטוס ההתראה");
+      return;
+    }
+    toast.success(status === "updated_quote" ? "סומן שעודכן בהצעת המחיר" : "ההתראה נסגרה ללא חיוב נוסף");
+    qc.invalidateQueries({ queryKey: ["pending_equipment_changes"] });
+    qc.invalidateQueries({ queryKey: ["event_equipment_changes"] });
+  }
+
   const visibleNav = useVisibleNav(can, isSuperAdmin, fullScope, profile.role);
   const home = homeRouteFor(profile.role);
   const safeHome = can(home === "/attendance" ? "attendance" : "calendar", "view")
@@ -253,9 +319,36 @@ export function AppShell({
               </Link>
             </div>
           ) : null}
+          {canHandleAlerts && pendingChanges.length > 0 ? (
+            <div className="px-3 pb-2">
+              <button
+                type="button"
+                onClick={() => setAlertsOpen(true)}
+                className="flex min-h-10 w-full items-center justify-between gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-start text-xs font-bold text-red-900 transition-colors hover:bg-red-100"
+              >
+                <span className="flex items-center gap-2 truncate">
+                  <Bell className="size-4 shrink-0 text-red-600" />
+                  <span className="truncate">שינויי ציוד מהשטח</span>
+                </span>
+                <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-red-600 px-1.5 py-0.5 text-[10px] font-extrabold text-white">
+                  {pendingChanges.length}
+                </span>
+              </button>
+            </div>
+          ) : null}
           <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2" aria-label="ניווט ראשי">
             {nav.map((item) => (
-              <NavLink key={item.to} item={item} badge={item.to === "/users" ? pendingCount : undefined} />
+              <NavLink
+                key={item.to}
+                item={item}
+                badge={
+                  item.to === "/users"
+                    ? pendingCount
+                    : item.to === "/events" && canHandleAlerts
+                      ? pendingChanges.length || undefined
+                      : undefined
+                }
+              />
             ))}
           </nav>
           <div className="border-t border-border p-3">
@@ -307,6 +400,19 @@ export function AppShell({
           </div>
         </div>
         <div className="flex items-center gap-1">
+          {canHandleAlerts && pendingChanges.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => setAlertsOpen(true)}
+              aria-label="התראות שינויי ציוד"
+              className="relative flex size-11 items-center justify-center rounded-lg text-red-600 hover:bg-red-50"
+            >
+              <Bell className="size-5" />
+              <span className="absolute end-1 top-1 inline-flex min-w-4 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white">
+                {pendingChanges.length}
+              </span>
+            </button>
+          ) : null}
           {canSearch ? (
             <Link
               to="/search"
@@ -396,6 +502,86 @@ export function AppShell({
           </Button>
         </div>
       </Sheet>
+
+      <Dialog
+        open={alertsOpen}
+        onOpenChange={setAlertsOpen}
+        title={`שינויי ציוד מהמחסן והשטח (${pendingChanges.length})`}
+        description="דיווחים שממתינים לבדיקת סוכן מכירות / מנהל לעדכון הצעת המחיר או סגירה"
+        size="lg"
+        footer={
+          <div className="flex justify-end">
+            <Button type="button" variant="outline" onClick={() => setAlertsOpen(false)}>סגירה</Button>
+          </div>
+        }
+      >
+        {!pendingChanges.length ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">אין התראות פתוחות כרגע.</p>
+        ) : (
+          <div className="max-h-[65vh] space-y-2.5 overflow-y-auto pe-1">
+            {pendingChanges.map((ch) => {
+              const ev = alertEventsMap.get(ch.event_id);
+              const meta = CHANGE_TYPE_META[ch.change_type];
+              const qId = ch.quote_id || quotesByEvent.get(ch.event_id) || null;
+              return (
+                <div key={ch.id} className="rounded-xl border border-border bg-muted/20 p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className={`rounded-md border px-2 py-0.5 text-[11px] font-bold ${meta.tone}`}>
+                          {meta.label}
+                        </span>
+                        <span className="text-xs font-bold text-foreground">
+                          {ev ? `${ev.title} (${dateShort(ev.event_date)})` : "אירוע"}
+                        </span>
+                        <span className="text-[11px] text-muted-foreground">
+                          · דווח מ{ch.source === "warehouse" ? "לוח השיבוץ/מחסן" : "השטח"} ע״י {ch.reported_by_name || "צוות"}
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-sm font-bold text-foreground">
+                        {meta.sign} {ch.item_name} × {num(ch.quantity)} {ch.unit || ""}
+                      </p>
+                      {ch.reason ? <p className="mt-0.5 text-xs text-muted-foreground">הערה: {ch.reason}</p> : null}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {qId && can("quotes", "edit") ? (
+                        <Button asChild size="sm" variant="outline" onClick={() => setAlertsOpen(false)}>
+                          <Link to="/quotes/$id" params={{ id: qId }}>
+                            <ExternalLink className="size-3.5" /> פתח הצעה
+                          </Link>
+                        </Button>
+                      ) : (
+                        <Button asChild size="sm" variant="outline" onClick={() => setAlertsOpen(false)}>
+                          <Link to="/events/$id" params={{ id: ch.event_id }}>
+                            <ExternalLink className="size-3.5" /> לאירוע
+                          </Link>
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={resolvingId === ch.id}
+                        onClick={() => resolveAlert(ch, "updated_quote")}
+                      >
+                        <Check className="size-3.5" /> עודכן בהצעה
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        disabled={resolvingId === ch.id}
+                        onClick={() => resolveAlert(ch, "no_charge")}
+                      >
+                        ללא חיוב
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Dialog>
     </div>
   );
 }
