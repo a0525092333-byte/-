@@ -1,9 +1,9 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { OfficeWindow } from "@/components/office/office-window";
+import { createFileRoute } from "@tanstack/react-router";
+import { OfficeBoard } from "@/components/office/office-board";
 
 export const Route = createFileRoute("/_app/office")({ component: OfficePage });
 
 function OfficePage() {
-  const navigate = useNavigate();
-  return <OfficeWindow open onClose={() => navigate({ to: "/" })} />;
+  return <OfficeBoard />;
 }
+// END OF FILE - src/routes/_app.office.tsx
