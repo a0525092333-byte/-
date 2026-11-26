@@ -724,6 +724,9 @@ const MIME_TYPES = {
   ".woff2": "font/woff2",
   ".ttf": "font/ttf",
   ".pdf": "application/pdf",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
 };
 
 const server = http.createServer(async (req, res) => {
@@ -731,6 +734,18 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || "localhost:3000";
   const requestOrigin = `${proto}://${host}`;
   const url = new URL(req.url || "/", requestOrigin);
+
+  // Neutralize legacy Vincen telemetry requests if cached in any browser tab
+  if (url.pathname.startsWith("/__vincen__/")) {
+    if (url.pathname.endsWith(".js")) {
+      res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-store" });
+      res.end("/* noop */\n");
+      return;
+    }
+    res.writeHead(204, { "cache-control": "no-store" });
+    res.end();
+    return;
+  }
 
   if (url.pathname.startsWith("/api/")) {
     const chunks = [];
@@ -804,26 +819,57 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let filePath = path.join(distDir, url.pathname === "/" ? "index.html" : url.pathname);
-  if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    const reqExt = path.extname(url.pathname).toLowerCase();
-    if (reqExt && reqExt !== ".html") {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
-      res.end("Asset not found");
+  // Static files + SPA fallback
+  let decodedPath = url.pathname;
+  try {
+    decodedPath = decodeURIComponent(url.pathname);
+  } catch {}
+
+  const relativeTarget = decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "");
+  const resolvedPath = path.resolve(distDir, relativeTarget);
+  const insideDist = resolvedPath === distDir || resolvedPath.startsWith(distDir + path.sep);
+
+  if (insideDist && fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
+    const ext = path.extname(resolvedPath).toLowerCase();
+    const headers = { "content-type": MIME_TYPES[ext] || "application/octet-stream" };
+    if (ext === ".html") {
+      headers["cache-control"] = "no-cache, no-store, must-revalidate";
+    } else if (decodedPath.startsWith("/assets/")) {
+      headers["cache-control"] = "public, max-age=31536000, immutable";
+    }
+    res.writeHead(200, headers);
+    if (req.method === "HEAD") {
+      res.end();
       return;
     }
-    filePath = path.join(distDir, "index.html");
+    fs.createReadStream(resolvedPath).pipe(res);
+    return;
   }
-  if (!fs.existsSync(filePath)) {
+
+  // Never serve index.html for missing static assets (/assets/* or file extensions)
+  const reqExt = path.extname(decodedPath).toLowerCase();
+  if (decodedPath.startsWith("/assets/") || decodedPath.includes("/assets/") || (reqExt && reqExt !== ".html")) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+    res.end("Not found");
+    return;
+  }
+
+  // SPA fallback for client-side routes (e.g. /quotes/:id, /events/:id)
+  const indexHtmlPath = path.join(distDir, "index.html");
+  if (!fs.existsSync(indexHtmlPath)) {
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Build dist/ not found. Run pnpm build first.");
     return;
   }
-  const ext = path.extname(filePath).toLowerCase();
-  const staticHeaders = { "content-type": MIME_TYPES[ext] || "application/octet-stream" };
-  if (ext === ".html") staticHeaders["cache-control"] = "no-cache";
-  res.writeHead(200, staticHeaders);
-  fs.createReadStream(filePath).pipe(res);
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-cache, no-store, must-revalidate",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  fs.createReadStream(indexHtmlPath).pipe(res);
 });
 
 const port = Number(process.env.PORT || 3000);
