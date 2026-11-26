@@ -30,6 +30,13 @@ export type EventReportCrew = {
   role: string | null;
 };
 
+export type EventReportImage = {
+  id: string;
+  data_url: string;
+  mime: string;
+  caption: string | null;
+};
+
 export type EventReport = {
   event: {
     id: string;
@@ -55,6 +62,7 @@ export type EventReport = {
   days: EventReportDay[];
   sections: EventReportSection[];
   crew: EventReportCrew[];
+  images?: EventReportImage[];
 };
 
 export async function fetchEventReport(
@@ -63,6 +71,7 @@ export async function fetchEventReport(
   try {
     const token = await getAccessToken().catch(() => null);
     const res = await fetch(`/api/events/${eventId}/report`, {
+      credentials: "include",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const text = await res.text();
@@ -84,3 +93,4 @@ export async function fetchEventReport(
     return { ok: false, status: 0, message: "לא הצלחנו לטעון את דוח האירוע — בדוק את החיבור ונסה שוב" };
   }
 }
+// END OF FILE - src/lib/event-report.ts
