@@ -9,11 +9,10 @@ import { currentUser, getAccessToken, refreshSession } from "@/integrations/neon
 import { sendInviteEmail } from "@/lib/invites";
 import { sendTestEmail } from "@/lib/password-reset";
 import { MODULES, ROLE_LABELS, ROLE_OPTIONS, presetRows } from "@/lib/permissions";
-import { EmptyState, ErrorState, NoAccess, PageHeader, PageSkeleton } from "@/components/shared";
+import { Avatar, EmptyState, ErrorState, NoAccess, PageHeader, PageSkeleton } from "@/components/shared";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Field, Select, Switch, Checkbox } from "@/components/ui/controls";
-import { Avatar } from "@/components/shared";
+import { Checkbox, Field, Select, Switch } from "@/components/ui/controls";
 import { PasswordResetDialog } from "@/components/users/password-reset-dialog";
 import { UserCalendarPreview } from "@/components/users/user-calendar-preview";
 import { RolePermissionReset, useSecurityAccess } from "@/components/users/role-permission-reset";
@@ -59,6 +58,50 @@ function HourlyRateField({ profile, onSave }: { profile: Profile; onSave: (value
           value={value}
           onChange={(e) => setValue(e.target.value)}
           placeholder="לא הוגדר"
+          className="h-11"
+        />
+        <Button type="button" variant="outline" className="h-11 shrink-0" onClick={save} disabled={saving}>
+          {saving ? "שומר…" : "שמירה"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function KmRateField({ profile, onSave }: { profile: Profile; onSave: (value: number | null) => Promise<void> }) {
+  const [value, setValue] = useState(profile.km_rate != null ? String(profile.km_rate) : "");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setValue(profile.km_rate != null ? String(profile.km_rate) : "");
+  }, [profile.km_rate]);
+
+  async function save() {
+    const trimmed = value.trim();
+    const parsed = trimmed === "" ? null : Number(trimmed);
+    if (parsed != null && (!Number.isFinite(parsed) || parsed < 0)) {
+      toast.error("התעריף לק״מ חייב להיות מספר חיובי");
+      return;
+    }
+    setSaving(true);
+    await onSave(parsed);
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <label htmlFor={`km-rate-${profile.id}`} className="mb-1 block text-xs font-medium text-muted-foreground">
+        החזר רכב אישי — תעריף לק״מ (₪)
+      </label>
+      <div className="flex gap-2">
+        <Input
+          id={`km-rate-${profile.id}`}
+          type="number"
+          min="0"
+          step="0.01"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="ברירת מחדל (1.80)"
           className="h-11"
         />
         <Button type="button" variant="outline" className="h-11 shrink-0" onClick={save} disabled={saving}>
@@ -290,9 +333,13 @@ function UsersPage() {
   }
 
   function toggleInvitePermission(module: Module, action: "view" | "edit", value: boolean) {
-    setInvitePermissions((current) => current.map((row) => row.module === module
-      ? { ...row, can_view: action === "view" ? value : value ? true : row.can_view, can_edit: action === "edit" ? value : value ? row.can_edit : false }
-      : row));
+    setInvitePermissions((current) =>
+      current.map((row) =>
+        row.module === module
+          ? { ...row, can_view: action === "view" ? value : value ? true : row.can_view, can_edit: action === "edit" ? value : value ? row.can_edit : false }
+          : row,
+      ),
+    );
   }
 
   async function createInvite(e: React.FormEvent) {
@@ -382,6 +429,16 @@ function UsersPage() {
     profilesQ.refetch();
   }
 
+  async function changeKmRate(profile: Profile, value: number | null) {
+    const { error } = await db.from("profiles").update({ km_rate: value }).eq("id", profile.id);
+    if (error) {
+      toast.error("לא הצלחנו לעדכן את התעריף לק״מ — ודא שהרצת את סקריפט ה-SQL ב-Neon");
+      return;
+    }
+    toast.success("התעריף לק״מ בחוזה עודכן");
+    profilesQ.refetch();
+  }
+
   async function copyInviteLink(email: string) {
     const link = `${window.location.origin}/login?invite=${encodeURIComponent(email)}`;
     try {
@@ -404,10 +461,7 @@ function UsersPage() {
 
   return (
     <div>
-      <PageHeader
-        title="ניהול משתמשים"
-        description="תפקידים, הרשאות מודולים והפעלת חשבונות"
-      />
+      <PageHeader title="ניהול משתמשים" description="תפקידים, הרשאות מודולים והפעלת חשבונות" />
 
       <RolePermissionReset />
 
@@ -574,38 +628,14 @@ function UsersPage() {
         </form>
       </Dialog>
 
-      <Dialog
-        open={invitesOpen}
-        onOpenChange={setInvitesOpen}
-        title="הזמנות ממתינות"
-        description="הזמנות שטרם מומשו באמצעות הרשמה."
-        size="lg"
-      >
+      <Dialog open={invitesOpen} onOpenChange={setInvitesOpen} title="הזמנות ממתינות" description="הזמנות שטרם מומשו באמצעות הרשמה." size="lg">
         {!invites.length ? (
           <p className="py-5 text-sm text-muted-foreground">אין כרגע הזמנות ממתינות.</p>
         ) : (
           <div className="space-y-2">
             {invites.map((invite) => {
-              const state =
-                invite.status === "accepted"
-                  ? "אושר"
-                  : invite.status === "cancelled"
-                    ? "בוטל"
-                    : invite.last_send_error
-                      ? "שליחה נכשלה"
-                      : invite.last_sent_at
-                        ? "נשלח"
-                        : "ממתין לאישור";
-              const tone =
-                invite.status === "accepted"
-                  ? "bg-emerald-100 text-emerald-800"
-                  : invite.status === "cancelled"
-                    ? "bg-muted text-muted-foreground"
-                    : invite.last_send_error
-                      ? "bg-red-100 text-red-700"
-                      : invite.last_sent_at
-                        ? "bg-sky-100 text-sky-800"
-                        : "bg-amber-100 text-amber-800";
+              const state = invite.status === "accepted" ? "אושר" : invite.status === "cancelled" ? "בוטל" : invite.last_send_error ? "שליחה נכשלה" : invite.last_sent_at ? "נשלח" : "ממתין לאישור";
+              const tone = invite.status === "accepted" ? "bg-emerald-100 text-emerald-800" : invite.status === "cancelled" ? "bg-muted text-muted-foreground" : invite.last_send_error ? "bg-red-100 text-red-700" : invite.last_sent_at ? "bg-sky-100 text-sky-800" : "bg-amber-100 text-amber-800";
               return (
                 <div key={invite.id} className="flex flex-col gap-3 rounded-lg border border-border/70 p-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
@@ -619,19 +649,9 @@ function UsersPage() {
                     {invite.last_send_error ? <p className="mt-1 text-xs text-red-700">{invite.last_send_error}</p> : null}
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Button type="button" variant="outline" size="sm" onClick={() => copyInviteLink(invite.email)}>
-                      <Copy className="size-4" />העתקת קישור
-                    </Button>
-                    {invite.status === "pending" ? (
-                      <Button type="button" variant="outline" size="sm" disabled={sending === invite.id} onClick={() => resendInvite(invite.id)}>
-                        <MailPlus className="size-4" /> {sending === invite.id ? "שולח..." : "שלח הזמנה שוב"}
-                      </Button>
-                    ) : null}
-                    {invite.status === "pending" ? (
-                      <Button type="button" variant="ghost" size="sm" onClick={() => cancelInvite(invite.id)}>
-                        <X className="size-4" />ביטול
-                      </Button>
-                    ) : null}
+                    <Button type="button" variant="outline" size="sm" onClick={() => copyInviteLink(invite.email)}><Copy className="size-4" />העתקת קישור</Button>
+                    {invite.status === "pending" ? <Button type="button" variant="outline" size="sm" disabled={sending === invite.id} onClick={() => resendInvite(invite.id)}><MailPlus className="size-4" /> {sending === invite.id ? "שולח..." : "שלח הזמנה שוב"}</Button> : null}
+                    {invite.status === "pending" ? <Button type="button" variant="ghost" size="sm" onClick={() => cancelInvite(invite.id)}><X className="size-4" />ביטול</Button> : null}
                   </div>
                 </div>
               );
@@ -640,13 +660,7 @@ function UsersPage() {
         )}
       </Dialog>
 
-      <Dialog
-        open={testOpen}
-        onOpenChange={setTestOpen}
-        title={passwordResetContent.emailTestTitle}
-        description={passwordResetContent.emailTestDescription}
-        size="sm"
-      >
+      <Dialog open={testOpen} onOpenChange={setTestOpen} title={passwordResetContent.emailTestTitle} description={passwordResetContent.emailTestDescription} size="sm">
         <div className="flex flex-wrap items-center gap-3">
           <Button type="button" variant="outline" onClick={testEmail} disabled={testBusy}>
             <Mail className="size-4" /> {testBusy ? passwordResetContent.sendingTest : passwordResetContent.testSend}
@@ -655,13 +669,7 @@ function UsersPage() {
         </div>
       </Dialog>
 
-      <Dialog
-        open={historyOpen}
-        onOpenChange={setHistoryOpen}
-        title={passwordResetContent.auditTitle}
-        description="מי איפס למי ומתי — ללא הסיסמה"
-        size="lg"
-      >
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen} title={passwordResetContent.auditTitle} description="מי איפס למי ומתי — ללא הסיסמה" size="lg">
         {!resets.length ? (
           <p className="py-5 text-sm text-muted-foreground">{passwordResetContent.auditEmpty}</p>
         ) : (
@@ -671,9 +679,7 @@ function UsersPage() {
               const target = profiles.find((p) => p.id === row.target_user_id);
               const adminName = admin?.full_name || admin?.email || "מנהל";
               const targetName = target?.full_name || row.target_email || "משתמש";
-              const when = new Intl.DateTimeFormat("he-IL", { dateStyle: "short", timeStyle: "short" }).format(
-                new Date(row.created_at),
-              );
+              const when = new Intl.DateTimeFormat("he-IL", { dateStyle: "short", timeStyle: "short" }).format(new Date(row.created_at));
               return (
                 <p key={row.id} className="rounded-lg border border-border/70 px-3 py-2 text-xs text-muted-foreground">
                   {passwordResetContent.auditLine(adminName, targetName, when)}
@@ -725,6 +731,7 @@ function UsersPage() {
                     </Select>
                   </div>
                   <HourlyRateField profile={profile} onSave={(value) => changeHourlyRate(profile, value)} />
+                  <KmRateField profile={profile} onSave={(value) => changeKmRate(profile, value)} />
                   {profile.phone ? <p className="text-xs text-muted-foreground" dir="ltr">{profile.phone}</p> : null}
                   <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
                     <span className="text-xs font-medium text-muted-foreground">חשבון פעיל</span>
@@ -882,3 +889,4 @@ function UsersPage() {
     </div>
   );
 }
+// END OF FILE - src/routes/_app.users.tsx
