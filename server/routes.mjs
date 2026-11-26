@@ -115,7 +115,6 @@ async function verifyCaller(headers, env, module = "quotes", action = "edit") {
     const approved = approvedRes.ok ? await approvedRes.json() : null;
     const perm = permRes.ok ? await permRes.json() : null;
     if (superAdmin === true) return { ok: true, isAdmin: true };
-    // A rejected/expired token must not be reported as "pending approval".
     if (adminRes.status === 401 || approvedRes.status === 401) {
       return { ok: false, status: 401, error: "unauthorized", message: "פג תוקף החיבור — התחבר מחדש ונסה שוב" };
     }
@@ -211,8 +210,6 @@ function stripDocumentPath(value) {
 }
 
 function normalizePath(value) {
-  // No trailing slash: "/api/invoices/wordpress/" answers 200 with an empty body
-  // and creates nothing, so the slash is always stripped.
   const path = String(value || "").trim().replace(/\/+$/, "");
   if (!path) return DEFAULT_DOCUMENT_PATH;
   return "/" + path.replace(/^\/+/, "");
@@ -500,7 +497,7 @@ async function logAttempt(db, {
     }
     await db.query(
       `INSERT INTO public.paperless_documents
-        (quote_id, event_id, client_id, doc_type, doc_number, doc_url, external_id, amount, status, raw_response, error_message, created_by)
+       (quote_id, event_id, client_id, doc_type, doc_number, doc_url, external_id, amount, status, raw_response, error_message, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)`,
       [quoteId, eventId, clientId, docType, docNumber, docUrl, externalId, amount, status, raw, errorMessage, createdBy],
     );
@@ -998,7 +995,6 @@ function sanitizeBackupData(data) {
         const field = Object.getOwnPropertyDescriptor(row, column);
         if (!field) continue;
         if (!("value" in field)) throw new Error("invalid_schema");
-        // Validate/copy only allowlisted values; unknown secret fields are never read.
         backupCanonicalJson(field.value);
         if (!backupValueValid(table, column, field.value)) throw new Error("invalid_schema");
         out[column] = JSON.parse(backupCanonicalJson(field.value));
@@ -1067,10 +1063,10 @@ function backupDenied(caller) {
     caller.error === "pending_approval"
       ? "אין הרשאה — החשבון ממתין לאישור מנהל"
       : caller.error === "forbidden"
-      ? "אין לך הרשאה לבצע פעולה זו"
-      : caller.error === "unauthorized"
-        ? "פג תוקף ההתחברות — יש להתחבר מחדש"
-        : "שגיאה בגיבוי — נסה שוב";
+        ? "אין לך הרשאה לבצע פעולה זו"
+        : caller.error === "unauthorized"
+          ? "פג תוקף ההתחברות — יש להתחבר מחדש"
+          : "שגיאה בגיבוי — נסה שוב";
   return { status: caller.status, body: { ok: false, error: caller.error, message } };
 }
 
@@ -1163,7 +1159,6 @@ async function auditRoute({ headers, env, db, url }) {
   const limit = Number(query.get("limit") ?? 50);
   const offset = Number(query.get("offset") ?? 0);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50 || !Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647) return { status: 400, body: { ok: false, error: "invalid_pagination" } };
-  // Sanitize historical details inside SQL before any values leave the database.
   const rows = await db.query(`SELECT id, user_id, action, module,
     public._security_clean_details(details) AS details,
     created_at FROM public.audit_logs ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, [limit + 1, offset]);
@@ -1173,8 +1168,6 @@ async function auditRoute({ headers, env, db, url }) {
 function storedBackupSafeSql() {
   const tables = BACKUP_TABLES.map((table) => `'${table}'`).join(",");
   const columnChecks = BACKUP_TABLES.map((table) => `(t.key = '${table}' AND c.key IN (${BACKUP_COLUMNS[table].map((column) => `'${column}'`).join(",")}))`).join(" OR ");
-  // CASE guards every set-returning function against malformed JSON. Unknown columns,
-  // opaque objects and nested arrays are denied in SQL before any payload leaves DB.
   return `jsonb_typeof(payload) = 'object'
     AND payload->'meta'->'version' = '2'::jsonb
     AND payload->'meta'->>'format' = '${BACKUP_FORMAT}'
@@ -1182,17 +1175,17 @@ function storedBackupSafeSql() {
     AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(CASE WHEN jsonb_typeof(payload) = 'object' THEN payload ELSE '{}'::jsonb END) k WHERE k NOT IN ('meta','data'))
     AND NOT EXISTS (SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(payload->'meta') = 'object' THEN payload->'meta' ELSE '{}'::jsonb END) m
       WHERE m.key NOT IN ('app','format','version','checksum','created_at','kind','created_by_email','counts','total_rows','skipped')
-      OR (m.key NOT IN ('counts','skipped') AND jsonb_typeof(m.value) NOT IN ('string','number','null'))
-      OR (m.key = 'counts' AND (jsonb_typeof(m.value) <> 'object' OR EXISTS (SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.value) = 'object' THEN m.value ELSE '{}'::jsonb END) n WHERE n.key NOT IN (${tables}) OR jsonb_typeof(n.value) <> 'number')))
-      OR (m.key = 'skipped' AND (jsonb_typeof(m.value) <> 'array' OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.value) = 'array' THEN m.value ELSE '[]'::jsonb END) s WHERE jsonb_typeof(s) <> 'string' OR s #>> '{}' NOT IN (${tables},'assets','project_config','audit_logs')))))
+        OR (m.key NOT IN ('counts','skipped') AND jsonb_typeof(m.value) NOT IN ('string','number','null'))
+        OR (m.key = 'counts' AND (jsonb_typeof(m.value) <> 'object' OR EXISTS (SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.value) = 'object' THEN m.value ELSE '{}'::jsonb END) n WHERE n.key NOT IN (${tables}) OR jsonb_typeof(n.value) <> 'number')))
+        OR (m.key = 'skipped' AND (jsonb_typeof(m.value) <> 'array' OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.value) = 'array' THEN m.value ELSE '[]'::jsonb END) s WHERE jsonb_typeof(s) <> 'string' OR s #>> '{}' NOT IN (${tables},'assets','project_config','audit_logs')))))
     AND NOT EXISTS (SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(payload->'data') = 'object' THEN payload->'data' ELSE '{}'::jsonb END) t
       WHERE t.key NOT IN (${tables}) OR jsonb_typeof(t.value) <> 'array' OR EXISTS (
         SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(t.value) = 'array' THEN t.value ELSE '[]'::jsonb END) r
         WHERE jsonb_typeof(r) <> 'object' OR EXISTS (
           SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(r) = 'object' THEN r ELSE '{}'::jsonb END) c
           WHERE NOT (${columnChecks}) OR jsonb_typeof(c.value) = 'object'
-          OR (jsonb_typeof(c.value) = 'array' AND (c.key NOT IN ('terms','default_terms','crew_roles') OR EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c.value) = 'array' THEN c.value ELSE '[]'::jsonb END) a WHERE jsonb_typeof(a) <> 'string'))))))`;
+            OR (jsonb_typeof(c.value) = 'array' AND (c.key NOT IN ('terms','default_terms','crew_roles') OR EXISTS (
+              SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c.value) = 'array' THEN c.value ELSE '[]'::jsonb END) a WHERE jsonb_typeof(a) <> 'string'))))))`;
 }
 
 async function loadStoredBackup(db, id) {
@@ -1217,7 +1210,6 @@ async function buildSnapshot(db, kind, email) {
   for (const table of BACKUP_TABLES) {
     try {
       const rows = await db.query(`SELECT ${BACKUP_COLUMNS[table].map((column) => `"${column}"`).join(",")} FROM public."${table}"`);
-      // Drivers may return timestamps as Date instances; normalize only known typed fields.
       const normalized = rows.map((row) => Object.fromEntries(BACKUP_COLUMNS[table].filter((column) => Object.hasOwn(row, column)).map((column) => {
         let value = row[column];
         if (value instanceof Date) value = BACKUP_DATES.has(column) ? value.toISOString().slice(0, 10) : value.toISOString();
@@ -1240,8 +1232,8 @@ async function buildSnapshot(db, kind, email) {
     meta: {
       app: "נס מולטימדיה",
       format: BACKUP_FORMAT,
-       version: BACKUP_VERSION,
-       checksum: await backupChecksum(data),
+      version: BACKUP_VERSION,
+      checksum: await backupChecksum(data),
       created_at: new Date().toISOString(),
       kind,
       created_by_email: email ?? null,
@@ -1263,9 +1255,9 @@ async function insertBackup(db, snapshot, kind, userId, email) {
   const results = await db.transaction([
     { text: `INSERT INTO public.backups
        (kind, created_by, created_by_email, counts, total_rows, size_bytes, payload)
-     VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7::jsonb)
-     RETURNING id, created_at`,
-    params: [kind, userId, email, JSON.stringify(snapshot.meta.counts), snapshot.meta.total_rows, size, payload] }, audit,
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7::jsonb)
+       RETURNING id, created_at`,
+      params: [kind, userId, email, JSON.stringify(snapshot.meta.counts), snapshot.meta.total_rows, size, payload] }, audit,
   ]);
   return { row: results[0][0], payload, size };
 }
@@ -1470,7 +1462,6 @@ async function existingKeys(db, table, pk) {
 
 function buildUpsert(table, rows, pk) {
   if (!Object.hasOwn(BACKUP_COLUMNS, table) || !backupDataValid({ [table]: rows }) || JSON.stringify(pk) !== JSON.stringify(primaryKeyFor(table))) throw new Error("invalid_schema");
-  // Each batch must have an identical column set; missing fields must not become NULL.
   const shape = Object.keys(rows[0]).sort().join(",");
   if (rows.some((row) => Object.keys(row).sort().join(",") !== shape)) throw new Error("invalid_schema");
   const cols = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
@@ -1505,11 +1496,6 @@ function backupClientScore(row) {
   );
 }
 
-/**
- * A pre-dedupe snapshot can hold several client rows with the same normalized
- * name. Collapse them to one survivor and re-point the snapshot's client_id
- * references so the restore does not violate clients_name_unique.
- */
 function dedupeBackupClients(data) {
   const clients = Array.isArray(data?.clients) ? data.clients : null;
   if (!clients || clients.length < 2) return data;
@@ -1551,14 +1537,6 @@ function dedupeBackupClients(data) {
   };
 }
 
-/**
- * Reconcile a snapshot's clients with the live table by normalized name. If the
- * live DB already has a client with the same normalized name under a different
- * id (e.g. the dedupe migration kept a different survivor), rewrite the
- * snapshot row to the live id and re-point the snapshot's client_id references,
- * so the restore updates the existing row instead of violating
- * clients_name_unique.
- */
 async function reconcileBackupClients(db, data) {
   const clients = Array.isArray(data?.clients) ? data.clients : null;
   if (!clients || !clients.length) return data;
@@ -1618,7 +1596,6 @@ async function backupRestore({ headers, env, db, body }) {
   const warnings = [];
   const statements = [];
   const deletions = [];
-  // BACKUP_TABLES is parent-first; delete in reverse order before inserting.
   for (const table of BACKUP_TABLES) {
     if (BACKUP_AUTH_TABLES.has(table)) {
       warnings.push(`skipped auth table: ${table}`);
@@ -1637,7 +1614,7 @@ async function backupRestore({ headers, env, db, body }) {
     }
     const rows = Array.isArray(data[table]) ? data[table] : null;
     if (!rows) {
-      perTable.push({ table, insert: 0, update: 0, unchanged: 0, deleted: 0, skipped: rows ? 0 : 0 });
+      perTable.push({ table, insert: 0, update: 0, unchanged: 0, deleted: 0, skipped: 0 });
       continue;
     }
     const pk = primaryKeyFor(table);
@@ -1678,7 +1655,6 @@ async function backupRestore({ headers, env, db, body }) {
         groups.set(key, group);
       }
       for (const group of groups.values()) {
-        // Bound parameter count, including large historical backups.
         const batchSize = Math.max(1, Math.floor(60000 / Object.keys(group[0]).length));
         for (let i = 0; i < group.length; i += batchSize) statements.push(buildUpsert(table, group.slice(i, i + batchSize), pk));
       }
@@ -1691,14 +1667,12 @@ async function backupRestore({ headers, env, db, body }) {
     try {
       await db.transaction(statements);
     } catch (e) {
-      // Accounting references/files are not backed up; their RESTRICT FKs must abort, never be bypassed.
       if (e?.code === "23503") return { status: 409, body: { ok: false, error: "invalid_restore", message: "השחזור בוטל ללא שינויים בגלל רשומות מקושרות. מסמכים וקבצים פיננסיים נשמרו. נסו מיזוג במקום החלפה, או בדקו את הקישורים לאירועים וללקוחות לפני ניסיון נוסף." } };
       throw e;
     }
   }
   return { status: 200, body: { ok: true, mode, per_table: perTable, warnings } };
 }
-
 
 async function driveSettingsRow(db) {
   const rows = await db.query(
@@ -1716,7 +1690,7 @@ async function driveStatusPayload(db) {
   const settings = settingsRows[0] || {};
   const sent = await db.query(
     `SELECT drive_sent_at, CASE WHEN drive_file_id ~ '^[a-zA-Z0-9_-]{1,200}$'
-       THEN 'https://drive.google.com/file/d/' || drive_file_id || '/view' ELSE NULL END AS drive_url FROM public.backups
+     THEN 'https://drive.google.com/file/d/' || drive_file_id || '/view' ELSE NULL END AS drive_url FROM public.backups
      WHERE drive_status = 'sent' ORDER BY drive_sent_at DESC NULLS LAST LIMIT 1`,
   );
   const failed = await db.query(
@@ -1818,11 +1792,11 @@ async function driveSettingsRoute({ headers, env, db, body }) {
   const token = typeof body?.token === "string" && body.token.trim() ? body.token.trim() : null;
   await db.query(
     `INSERT INTO public.company_settings
-       (id, backup_drive_enabled, backup_drive_url, backup_drive_folder, backup_drive_token)
+     (id, backup_drive_enabled, backup_drive_url, backup_drive_folder, backup_drive_token)
      VALUES (1, $1, $2, $3, $4)
      ON CONFLICT (id) DO UPDATE SET
        backup_drive_enabled = EXCLUDED.backup_drive_enabled,
-        backup_drive_url = COALESCE(EXCLUDED.backup_drive_url, public.company_settings.backup_drive_url),
+       backup_drive_url = COALESCE(EXCLUDED.backup_drive_url, public.company_settings.backup_drive_url),
        backup_drive_folder = EXCLUDED.backup_drive_folder,
        backup_drive_token = COALESCE(EXCLUDED.backup_drive_token, public.company_settings.backup_drive_token)`,
     [enabled, url, folder, token],
@@ -1938,12 +1912,12 @@ async function sendInviteEmail({ headers, env, db, body, url }) {
   const html = emailShell({
     heading: "הזמנה להצטרף למערכת",
     bodyHtml: `
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${invite.full_name ? ` ${invite.full_name}` : ""},</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">${admin.full_name || admin.email || "מנהל המערכת"} הזמין/ה אותך להצטרף למערכת ניהול ההפקות.</p>
-    <p style="margin:0 0 16px;font-size:14px;line-height:1.7">כדי להשלים את ההרשמה ולקבוע סיסמה, לחצו על הכפתור:</p>
-    <p style="margin:0 0 16px"><a href="${link}" style="display:inline-block;background:#312e81;color:#ffffff;padding:12px 22px;border-radius:10px;text-decoration:none;font-size:14px;font-weight:bold">השלמת ההרשמה</a></p>
-    <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">התפקיד וההרשאות שהוגדרו עבורך יוחלו אוטומטית לאחר ההרשמה.</p>
-  `,
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${invite.full_name ? ` ${invite.full_name}` : ""},</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">${admin.full_name || admin.email || "מנהל המערכת"} הזמין/ה אותך להצטרף למערכת ניהול ההפקות.</p>
+      <p style="margin:0 0 16px;font-size:14px;line-height:1.7">כדי להשלים את ההרשמה ולקבוע סיסמה, לחצו על הכפתור:</p>
+      <p style="margin:0 0 16px"><a href="${link}" style="display:inline-block;background:#312e81;color:#ffffff;padding:12px 22px;border-radius:10px;text-decoration:none;font-size:14px;font-weight:bold">השלמת ההרשמה</a></p>
+      <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">התפקיד וההרשאות שהוגדרו עבורך יוחלו אוטומטית לאחר ההרשמה.</p>
+    `,
   });
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -2084,13 +2058,13 @@ async function sendTempPasswordEmail({ env, to, fullName, password }) {
   const html = emailShell({
     heading: "סיסמה זמנית חדשה",
     bodyHtml: `
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${fullName ? ` ${fullName}` : ""},</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">התקבלה בקשה לאיפוס הסיסמה לחשבון שלך במערכת "נס מולטימדיה".</p>
-    <p style="margin:0 0 8px;font-size:13px;color:#374151">הסיסמה הזמנית החדשה:</p>
-    <p style="margin:0 0 16px;font-size:22px;font-weight:bold;letter-spacing:2px;background:#eef2ff;border:1px solid #c7d2fe;padding:12px 16px;border-radius:10px;text-align:center;color:#312e81" dir="ltr">${password}</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">יש להתחבר עם כתובת המייל שאליה נשלחה הודעה זו (<span dir="ltr">${to}</span>) ועם הסיסמה הזמנית, ולהחליף אותה בהקדם.</p>
-    <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">אם לא ביקשת איפוס סיסמה, אפשר להתעלם מהודעה זו.</p>
-  `,
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${fullName ? ` ${fullName}` : ""},</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">התקבלה בקשה לאיפוס הסיסמה לחשבון שלך במערכת "נס מולטימדיה".</p>
+      <p style="margin:0 0 8px;font-size:13px;color:#374151">הסיסמה הזמנית החדשה:</p>
+      <p style="margin:0 0 16px;font-size:22px;font-weight:bold;letter-spacing:2px;background:#eef2ff;border:1px solid #c7d2fe;padding:12px 16px;border-radius:10px;text-align:center;color:#312e81" dir="ltr">${password}</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">יש להתחבר עם כתובת המייל שאליה נשלחה הודעה זו (<span dir="ltr">${to}</span>) ועם הסיסמה הזמנית, ולהחליף אותה בהקדם.</p>
+      <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">אם לא ביקשת איפוס סיסמה, אפשר להתעלם מהודעה זו.</p>
+    `,
   });
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -2197,13 +2171,13 @@ async function sendPasswordEmailRoute({ headers, env, db, body }) {
   const html = emailShell({
     heading: "סיסמה זמנית חדשה",
     bodyHtml: `
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${target.full_name ? ` ${target.full_name}` : ""},</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">המנהל איפס את הסיסמה לחשבון שלך במערכת "נס מולטימדיה".</p>
-    <p style="margin:0 0 8px;font-size:13px;color:#374151">הסיסמה הזמנית החדשה:</p>
-    <p style="margin:0 0 16px;font-size:22px;font-weight:bold;letter-spacing:2px;background:#eef2ff;border:1px solid #c7d2fe;padding:12px 16px;border-radius:10px;text-align:center;color:#312e81" dir="ltr">${password}</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">יש להתחבר עם כתובת המייל שאליה נשלחה הודעה זו (<span dir="ltr">${target.email}</span>) ועם הסיסמה הזמנית, ולהחליף אותה בהקדם.</p>
-    <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">אם לא ביקשת איפוס סיסמה, פנה למנהל המערכת.</p>
-  `,
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${target.full_name ? ` ${target.full_name}` : ""},</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">המנהל איפס את הסיסמה לחשבון שלך במערכת "נס מולטימדיה".</p>
+      <p style="margin:0 0 8px;font-size:13px;color:#374151">הסיסמה הזמנית החדשה:</p>
+      <p style="margin:0 0 16px;font-size:22px;font-weight:bold;letter-spacing:2px;background:#eef2ff;border:1px solid #c7d2fe;padding:12px 16px;border-radius:10px;text-align:center;color:#312e81" dir="ltr">${password}</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">יש להתחבר עם כתובת המייל שאליה נשלחה הודעה זו (<span dir="ltr">${target.email}</span>) ועם הסיסמה הזמנית, ולהחליף אותה בהקדם.</p>
+      <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">אם לא ביקשת איפוס סיסמה, פנה למנהל המערכת.</p>
+    `,
   });
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -2258,10 +2232,10 @@ async function sendTestEmailRoute({ headers, env, db }) {
   const html = emailShell({
     heading: "בדיקת שליחה",
     bodyHtml: `
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${admin.full_name ? ` ${admin.full_name}` : ""},</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">זהו מייל בדיקה ממערכת "נס מולטימדיה".</p>
-    <p style="margin:0;font-size:14px;line-height:1.7">אם קיבלת אותו, שליחת המיילים מוגדרת ועובדת כראוי.</p>
-  `,
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${admin.full_name ? ` ${admin.full_name}` : ""},</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">זהו מייל בדיקה ממערכת "נס מולטימדיה".</p>
+      <p style="margin:0;font-size:14px;line-height:1.7">אם קיבלת אותו, שליחת המיילים מוגדרת ועובדת כראוי.</p>
+    `,
   });
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -2324,13 +2298,12 @@ export function parseTtf(b) {
     }
     advances[g] = last;
   }
-  // cmap: prefer format 12, then format 4
   const cmapOff = tables.cmap.offset;
   const nSub = u16(b, cmapOff + 2);
   let best = null;
   for (let i = 0; i < nSub; i++) {
     const rec = cmapOff + 4 + i * 8;
-    const platform = u16(b, rec), encoding = u16(b, rec + 2);
+    const platform = u16(b, rec);
     const sub = cmapOff + u32(b, rec + 4);
     const format = u16(b, sub);
     if (format === 12 && (platform === 3 || platform === 0)) best = { sub, format };
@@ -2377,6 +2350,11 @@ export function parseTtf(b) {
 const HEBREW = /[\u0590-\u05FF]/;
 const RTL_CHAR = /[\u0590-\u05FF\u200F\u202B]/;
 const LTR_CHAR = /[A-Za-z0-9\u00C0-\u024F]/;
+const MIRROR_MAP = { "(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{", "<": ">", ">": "<" };
+
+function mirrorGlyphs(str) {
+  return Array.from(str, (ch) => MIRROR_MAP[ch] || ch).join("");
+}
 
 function classify(ch) {
   if (RTL_CHAR.test(ch)) return "rtl";
@@ -2385,22 +2363,58 @@ function classify(ch) {
 }
 
 function visualRuns(text) {
-  const chars = Array.from(text);
+  const clean = String(text ?? "")
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "")
+    .replace(/([\u0590-\u05FF])(\d)/g, "$1 $2")
+    .replace(/(\d)([\u0590-\u05FF])/g, "$1 $2");
+  const chars = Array.from(clean);
+  if (!chars.length) return [];
   const baseRtl = chars.some((c) => HEBREW.test(c));
+  const baseDir = baseRtl ? "rtl" : "ltr";
+
+  const types = chars.map((ch) => classify(ch));
+  const resolved = new Array(chars.length);
+
+  for (let i = 0; i < chars.length; i += 1) {
+    if (types[i] !== "neutral") {
+      resolved[i] = types[i];
+      continue;
+    }
+    const ch = chars[i];
+    let prevStrong = null;
+    for (let j = i - 1; j >= 0; j -= 1) {
+      if (types[j] !== "neutral") { prevStrong = types[j]; break; }
+    }
+    let nextStrong = null;
+    for (let j = i + 1; j < chars.length; j += 1) {
+      if (types[j] !== "neutral") { nextStrong = types[j]; break; }
+    }
+
+    if (prevStrong === "ltr" && nextStrong === "ltr" && /[.,:/\-+*@_]/.test(ch)) {
+      resolved[i] = "ltr";
+    } else if (prevStrong === "ltr" && nextStrong === "ltr" && ch === " ") {
+      resolved[i] = "ltr";
+    } else if (prevStrong && prevStrong === nextStrong) {
+      resolved[i] = prevStrong;
+    } else {
+      resolved[i] = baseDir;
+    }
+  }
+
   const runs = [];
   let cur = null;
-  for (const ch of chars) {
-    const cls = classify(ch);
-    const dir = cls === "neutral" ? (cur ? cur.dir : baseRtl ? "rtl" : "ltr") : cls;
+  for (let i = 0; i < chars.length; i += 1) {
+    const dir = resolved[i];
     if (!cur || cur.dir !== dir) {
       cur = { dir, chars: [] };
       runs.push(cur);
     }
-    cur.chars.push(ch);
+    cur.chars.push(chars[i]);
   }
+
   return runs.map((r) => ({
     dir: r.dir,
-    text: r.dir === "rtl" ? r.chars.reverse().join("") : r.chars.join(""),
+    text: r.dir === "rtl" ? mirrorGlyphs(r.chars.slice().reverse().join("")) : r.chars.join(""),
   }));
 }
 
@@ -2420,6 +2434,41 @@ function textWidth(text, font, size) {
     units += font.advances[gid] ?? 0;
   }
   return (units * size) / font.unitsPerEm;
+}
+
+function wrapRtlLines(text, maxWidth, font, size) {
+  const raw = String(text ?? "")
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "")
+    .replace(/([\u0590-\u05FF])(\d)/g, "$1 $2")
+    .replace(/(\d)([\u0590-\u05FF])/g, "$1 $2")
+    .trim();
+  if (!raw) return [];
+  if (textWidth(raw, font, size) <= maxWidth) return [raw];
+  const words = raw.split(/\s+/);
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (textWidth(candidate, font, size) <= maxWidth) {
+      current = candidate;
+    } else if (!current) {
+      let chunk = "";
+      for (const ch of Array.from(word)) {
+        if (textWidth(chunk + ch, font, size) <= maxWidth) {
+          chunk += ch;
+        } else {
+          if (chunk) lines.push(chunk);
+          chunk = ch;
+        }
+      }
+      current = chunk;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
 }
 
 function drawRun(text, x, y, size, font) {
@@ -2547,7 +2596,11 @@ function getQuoteFont() {
 
 function quoteMoney(n, digits = 2) {
   const v = Number(n ?? 0);
-  return v.toLocaleString("he-IL", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  const safe = Number.isFinite(v) ? v : 0;
+  const neg = safe < 0 ? "-" : "";
+  const [intPart, decPart] = Math.abs(safe).toFixed(digits).split(".");
+  const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return digits > 0 ? `${neg}${withCommas}.${decPart}` : `${neg}${withCommas}`;
 }
 
 function quoteDate(value) {
@@ -2605,6 +2658,7 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
   const W = 595.28;
   const H = 841.89;
   const M = 40;
+  const CONTENT_W = W - 2 * M;
   const pages = [];
   let ops = [];
   let y = H - M;
@@ -2624,6 +2678,13 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
     ops.push(`0.95 g\n${x.toFixed(2)} ${yy.toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)} re f\n0 g\n`);
   };
   const newPage = () => { pages.push(ops.join("")); ops = []; y = H - M; };
+  const ensureSpace = (needed) => {
+    if (y - needed < M + 28) {
+      newPage();
+      return true;
+    }
+    return false;
+  };
 
   const subtotal = items.reduce((sum, it) => sum + itemLineTotal(it), 0);
   const discountValue = Number(quote.discount_value ?? 0);
@@ -2636,8 +2697,8 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
   let headerTop = H - M;
   if (logo && logo.buffer) {
     const ratio = logo.width / logo.height;
-    const maxLogoW = (W - 2 * M) * 0.6;
-    let logoH = 112;
+    const maxLogoW = CONTENT_W * 0.56;
+    let logoH = 104;
     let logoW = logoH * ratio;
     if (logoW > maxLogoW) {
       logoW = maxLogoW;
@@ -2647,49 +2708,79 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
     ops.push(`q ${logoW.toFixed(2)} 0 0 ${logoH.toFixed(2)} ${logoX.toFixed(2)} ${(H - M - logoH).toFixed(2)} cm /Logo Do Q\n`);
     headerTop = H - M - logoH - 14;
   }
+
   y = headerTop;
-  rtl(settings?.company_name || "נס מולטימדיה", W - M, y, 18);
+  rtl(settings?.company_name || "נס מולטימדיה", W - M, y, 17);
   y -= 16;
-  if (settings?.tax_id) { rtl(`ח.פ/ע.מ: ${settings.tax_id}`, W - M, y, 9); y -= 12; }
-  if (settings?.phone) { rtl(settings.phone, W - M, y, 9); y -= 12; }
-  if (settings?.email) { rtl(settings.email, W - M, y, 9); y -= 12; }
+  const cleanTaxId = String(settings?.tax_id ?? "").replace(/[^\dA-Za-z\-]/g, "").trim();
+  if (cleanTaxId) { rtl(`ח.פ / ע.מ: ${cleanTaxId}`, W - M, y, 9); y -= 12; }
+  if (settings?.phone) { rtl(`טלפון: ${String(settings.phone).trim()}`, W - M, y, 9); y -= 12; }
+  if (settings?.email) { rtl(`אימייל: ${String(settings.email).trim()}`, W - M, y, 9); y -= 12; }
 
   let leftY = headerTop;
-  rtl(`הצעת מחיר מס׳ ${quote.quote_number}`, W - M - 250, leftY, 14);
-  leftY -= 18;
-  rtl(`תאריך הצעה: ${quoteDateShort(quote.issue_date || quote.quote_date)}`, W - M - 250, leftY, 10);
+  const leftColRight = M + 215;
+  rtl(`הצעת מחיר מס׳ ${quote.quote_number}`, leftColRight, leftY, 13);
+  leftY -= 17;
+  rtl(`תאריך הצעה: ${quoteDateShort(quote.issue_date || quote.quote_date)}`, leftColRight, leftY, 9.5);
   leftY -= 14;
-  rtl(`תאריך הדפסה: ${quoteDateShort(quote.print_date || new Date().toISOString().slice(0, 10))}`, W - M - 250, leftY, 10);
+  rtl(`תאריך הדפסה: ${quoteDateShort(quote.print_date || new Date().toISOString().slice(0, 10))}`, leftColRight, leftY, 9.5);
 
   y = Math.min(y, leftY) - 10;
   rule(y, 1.2);
-  y -= 20;
+  y -= 18;
 
-  rtl(`לכבוד: ${quote.client_name || ""}`, W - M, y, 11);
-  y -= 16;
-  if (quote.venue) { const venue = String(quote.venue).trim(); rtl(`עבור אירוע ${venue.startsWith("ב") ? "" : "ב"}${venue}`, W - M, y, 10); y -= 14; }
-  if (eventAddress) { rtl(`כתובת האירוע: ${eventAddress}`, W - M, y, 10); y -= 14; }
-  if (quote.client_address) { rtl(`כתובת הלקוח: ${quote.client_address}`, W - M, y, 10); y -= 14; }
-  if (quote.event_date) { rtl(`בתאריך: יום ${quoteWeekday(quote.event_date)}, ${quoteDateShort(quote.event_date)}`, W - M, y, 10); y -= 14; }
-  if (quote.event_contact_name) {
-    rtl(`איש קשר באירוע: ${quote.event_contact_name}${quote.event_contact_phone ? ` · ${quote.event_contact_phone}` : ""}`, W - M, y, 10);
-    y -= 14;
+  const drawWrappedMeta = (text, size = 10, step = 14) => {
+    const lines = wrapRtlLines(text, CONTENT_W, font, size);
+    for (const ln of lines) {
+      ensureSpace(step + 6);
+      rtl(ln, W - M, y, size);
+      y -= step;
+    }
+  };
+
+  drawWrappedMeta(`לכבוד: ${quote.client_name || ""}`, 11, 15);
+  if (quote.venue) {
+    const venue = String(quote.venue).trim();
+    drawWrappedMeta(`עבור אירוע ${venue.startsWith("ב") ? "" : "ב"}${venue}`, 10, 14);
   }
-  if (quote.subject) { rtl(`נושא: ${quote.subject}`, W - M, y, 10); y -= 14; }
-  y -= 6;
+  if (eventAddress) drawWrappedMeta(`כתובת האירוע: ${eventAddress}`, 10, 14);
+  if (quote.client_address) drawWrappedMeta(`כתובת הלקוח: ${quote.client_address}`, 10, 14);
+  if (quote.event_date) {
+    const wd = quoteWeekday(quote.event_date);
+    const ds = quoteDateShort(quote.event_date);
+    drawWrappedMeta(`בתאריך: ${wd ? `יום ${wd}, ` : ""}${ds}`, 10, 14);
+  }
+  if (quote.event_contact_name) {
+    drawWrappedMeta(
+      `איש קשר באירוע: ${quote.event_contact_name}${quote.event_contact_phone ? ` · ${quote.event_contact_phone}` : ""}`,
+      10,
+      14,
+    );
+  }
+  const cleanSubject = String(quote.subject ?? "").trim();
+  const cleanClient = String(quote.client_name ?? "").trim();
+  if (cleanSubject && cleanSubject !== cleanClient) {
+    drawWrappedMeta(`נושא: ${cleanSubject}`, 10, 14);
+  }
+
+  y -= 4;
   rule(y, 0.6);
   y -= 18;
 
+  // Column layout (right-to-left) with strict non-overlapping widths:
+  // [Total: M .. M+78] [Qty: M+84 .. M+132] [Price: M+138 .. M+214] [Item: M+222 .. W-M-28] [#: W-M-24 .. W-M]
   const colNum = W - M;
-  const colItem = W - M - 30;
-  const colPrice = W - M - 280;
-  const colQty = W - M - 360;
-  const colTotal = W - M - 410;
+  const colItemRight = W - M - 28;
+  const colItemLeft = M + 224;
+  const itemMaxW = colItemRight - colItemLeft;
+  const colPrice = M + 214;
+  const colQty = M + 132;
+  const colTotal = M + 78;
 
   const tableHeader = () => {
-    grayRect(M, y - 4, W - 2 * M, 18);
+    grayRect(M, y - 4, CONTENT_W, 18);
     rtl("מס׳", colNum, y, 9);
-    rtl("פריט / תיאור", colItem, y, 9);
+    rtl("פריט / תיאור", colItemRight, y, 9);
     rtl("מחיר ליחידה", colPrice, y, 9);
     rtl("כמות", colQty, y, 9);
     rtl("סכום לפני מע״מ", colTotal, y, 9);
@@ -2700,32 +2791,55 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
 
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i];
-    const desc = item.description ? String(item.description).split(/\r?\n/).filter(Boolean) : [];
-    const rowH = 14 + desc.length * 10 + (item.is_optional ? 10 : 0) + 16;
-    if (y - rowH < M + 40) {
+    const nameLines = wrapRtlLines(item.name || "", itemMaxW, font, 9.5);
+    const rawDescLines = item.description ? String(item.description).split(/\r?\n/).filter(Boolean) : [];
+    const descLines = rawDescLines.flatMap((dl) => wrapRtlLines(dl, itemMaxW, font, 8.2));
+    const totalTextLines = Math.max(1, nameLines.length) + descLines.length + (item.is_optional ? 1 : 0);
+    const rowH = Math.max(16, nameLines.length * 12 + descLines.length * 10.5 + (item.is_optional ? 10.5 : 0)) + 12;
+
+    if (y - rowH < M + 32) {
       newPage();
       tableHeader();
     }
-    rtl(String(i + 1), colNum, y, 9);
-    rtl(item.name || "", colItem, y, 10);
-    ltrRight("₪" + quoteMoney(item.unit_price), colPrice, y, 9);
-    rtl(`${item.quantity ?? item.qty ?? 1} ${item.unit ?? ""}`.trim(), colQty, y, 9);
-    ltrRight("₪" + quoteMoney(itemLineTotal(item)), colTotal, y, 9);
-    y -= 13;
-    for (const lineText of desc) { rtl(lineText, colItem, y, 8); y -= 10; }
-    if (item.is_optional) { rtl("אופציונלי", colItem, y, 8); y -= 10; }
-    y -= 4;
+
+    const rowTopY = y;
+    rtl(String(i + 1), colNum, rowTopY, 9);
+    ltrRight("₪" + quoteMoney(item.unit_price), colPrice, rowTopY, 8.8);
+    const qtyVal = item.quantity ?? item.qty ?? 1;
+    const qtyLabel = `${Number.isInteger(Number(qtyVal)) ? Number(qtyVal) : Number(qtyVal).toFixed(2)} ${item.unit ?? ""}`.trim();
+    rtl(qtyLabel, colQty, rowTopY, 8.8);
+    ltrRight("₪" + quoteMoney(itemLineTotal(item)), colTotal, rowTopY, 8.8);
+
+    if (nameLines.length) {
+      for (const nLine of nameLines) {
+        rtl(nLine, colItemRight, y, 9.5);
+        y -= 12;
+      }
+    } else {
+      y -= 12;
+    }
+    for (const dLine of descLines) {
+      rtl(dLine, colItemRight, y, 8.2);
+      y -= 10.5;
+    }
+    if (item.is_optional) {
+      rtl("אופציונלי", colItemRight, y, 8);
+      y -= 10.5;
+    }
+    if (totalTextLines === 1) y -= 2;
+    y -= 3;
     rule(y, 0.4);
-    y -= 12;
+    y -= 11;
   }
 
   const pdfImages = (images || []).map(decodeQuoteImage).filter(Boolean);
   if (pdfImages.length) {
+    ensureSpace(140);
     rtl("תמונות", W - M, y, 11);
     y -= 14;
     const cols = 3;
     const gap = 8;
-    const cellW = (W - 2 * M - gap * (cols - 1)) / cols;
+    const cellW = (CONTENT_W - gap * (cols - 1)) / cols;
     const maxImgH = 120;
     for (let i = 0; i < pdfImages.length; i += cols) {
       const row = pdfImages.slice(i, i + cols);
@@ -2738,12 +2852,12 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
       });
       const hasCaption = row.some((img) => img.caption);
       const rowH = Math.max(...sizes.map((size) => size.h)) + (hasCaption ? 12 : 0) + 6;
-      if (y - rowH < M + 40) {
+      if (y - rowH < M + 32) {
         newPage();
         rtl("תמונות (המשך)", W - M, y, 11);
         y -= 14;
       }
-      for (let j = 0; j < row.length; j++) {
+      for (let j = 0; j < row.length; j += 1) {
         const img = row[j];
         const { w, h } = sizes[j];
         const x = W - M - (j + 1) * cellW - j * gap + (cellW - w) / 2;
@@ -2757,62 +2871,86 @@ function buildQuotePdf({ quote, items, settings, eventAddress, logo = QUOTE_LOGO
 
   const noteLines = quote.notes ? String(quote.notes).split(/\r?\n/).filter(Boolean) : [];
   const termsText = (quote.terms_text && String(quote.terms_text).trim()) || (Array.isArray(quote.terms) ? quote.terms.join("\n") : "");
-  const terms = termsText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  let by = y - 10;
-  const summaryHeight = (discount > 0 ? 4 : 3) * 16 + 26;
-  if (by - summaryHeight < M + 40) {
-    newPage();
-    by = y - 10;
-  }
-  const labelX = M + 360;
-  const valueX = M + 20;
+  const terms = termsText.split(/\r?\n/).map((ln) => ln.trim()).filter(Boolean);
+
   const summaryRows = [
     ["סך הכול לפני הנחה", quoteMoney(subtotal)],
     ...(discount > 0 ? [[`הנחה ${quote.discount_type === "percent" ? `${discountValue}%` : ""}`, quoteMoney(discount)]] : []),
     ["מחיר לפני מע״מ", quoteMoney(afterDiscount)],
     [`מע״מ ${vatRate}%`, quoteMoney(vat)],
   ];
-  for (const [label, value] of summaryRows) {
-    rtl(label, labelX, by, 10);
-    ltrLeft("₪" + value, valueX, by, 10);
-    by -= 16;
+  const summaryHeight = summaryRows.length * 16 + 32;
+  if (y - summaryHeight < M + 32) {
+    newPage();
   }
-  rule(by + 12, 1);
-  rtl("סה״כ לתשלום", labelX, by, 12);
-  ltrLeft("₪" + quoteMoney(grand, 0), valueX, by, 12);
-  by -= 26;
+  y -= 6;
+
+  const labelX = M + 215;
+  const valueX = M + 4;
+  for (const [label, value] of summaryRows) {
+    rtl(label, labelX, y, 10);
+    ltrLeft("₪" + value, valueX, y, 10);
+    y -= 16;
+  }
+  rule(y + 11, 1);
+  rtl("סה״כ לתשלום", labelX, y, 12);
+  ltrLeft("₪" + quoteMoney(grand, 0), valueX, y, 12);
+  y -= 24;
 
   if (noteLines.length) {
-    rtl("הערות", W - M, by, 11);
-    by -= 14;
-    for (const lineText of noteLines) { rtl(lineText, W - M, by, 9); by -= 12; }
-    by -= 6;
+    ensureSpace(28);
+    rtl("הערות", W - M, y, 11);
+    y -= 14;
+    for (const rawNote of noteLines) {
+      for (const nLine of wrapRtlLines(rawNote, CONTENT_W, font, 9)) {
+        ensureSpace(14);
+        rtl(nLine, W - M, y, 9);
+        y -= 12;
+      }
+    }
+    y -= 6;
   }
 
   if (terms.length) {
-    rtl("תנאים / הסכם", W - M, by, 11);
-    by -= 14;
-    terms.forEach((term, i) => { rtl(`${i + 1}. ${term}`, W - M, by, 9.5); by -= 12; });
-    by -= 6;
+    ensureSpace(28);
+    rtl("תנאים / הסכם", W - M, y, 11);
+    y -= 14;
+    terms.forEach((term, idx) => {
+      const cleanTerm = term.replace(/^\s*(?:\.?\d+\s*[.)]?\s*)+/, "");
+      const wrapped = wrapRtlLines(`${idx + 1}. ${cleanTerm}`, CONTENT_W, font, 9);
+      for (const tLine of wrapped) {
+        ensureSpace(14);
+        rtl(tLine, W - M, y, 9);
+        y -= 12;
+      }
+    });
+    y -= 8;
   }
 
-  const sigY = by - 10;
+  // Ensure signature block never collides with the page footer
+  const sigHeight = 68;
+  if (y - sigHeight < M + 24) {
+    newPage();
+  }
+  const sigY = y - 8;
   rtl("המזמין", W - M, sigY, 10);
-  rtl(settings?.company_name || "החברה", W - M - 250, sigY, 10);
-  if (settings?.address) { rtl(settings.address, W - M - 250, sigY - 12, 8); }
-  ops.push(line(W - M - 220, sigY - 28, W - M, sigY - 28, 0.6));
-  ops.push(line(M, sigY - 28, M + 220, sigY - 28, 0.6));
-  rtl("חתימה :", W - M, sigY - 40, 8);
-  rtl("חתימה :", W - M - 250, sigY - 40, 8);
-  rtl("תאריך :", W - M, sigY - 52, 8);
-  rtl("תאריך :", W - M - 250, sigY - 52, 8);
+  rtl(settings?.company_name || "החברה", W - M - 260, sigY, 10);
+  if (settings?.address) {
+    rtl(String(settings.address).trim(), W - M - 260, sigY - 12, 8);
+  }
+  ops.push(line(W - M - 210, sigY - 28, W - M, sigY - 28, 0.6));
+  ops.push(line(M, sigY - 28, M + 210, sigY - 28, 0.6));
+  rtl("חתימה:", W - M, sigY - 40, 8);
+  rtl("חתימה:", W - M - 260, sigY - 40, 8);
+  rtl("תאריך:", W - M, sigY - 52, 8);
+  rtl("תאריך:", W - M - 260, sigY - 52, 8);
 
   pages.push(ops.join(""));
   const totalPages = pages.length;
-  const withFooters = pages.map((content, i) => {
-    const footerText = `עמוד ${i + 1} מתוך ${totalPages}`;
+  const withFooters = pages.map((content, idx) => {
+    const footerText = `עמוד ${idx + 1} מתוך ${totalPages}`;
     const fw = textWidth(footerText, font, 8);
-    return content + drawTextRTL(footerText, W / 2 + fw / 2, M - 10, 8, font).ops;
+    return content + drawTextRTL(footerText, W / 2 + fw / 2, M - 14, 8, font).ops;
   });
   return buildPdf(font, withFooters, logo, pdfImages);
 }
@@ -2872,9 +3010,10 @@ async function sendQuoteEmailRoute({ headers, env, db, body, id }) {
   );
   const settings = settingsRows[0] || {};
   const eventRows = quote.event_id
-    ? await db.query(`SELECT address FROM public.events WHERE id = $1`, [quote.event_id])
+    ? await db.query(`SELECT address, venue, event_date, start_date FROM public.events WHERE id = $1`, [quote.event_id])
     : [];
-  const eventAddress = (quote.event_address && String(quote.event_address).trim()) || eventRows[0]?.address || null;
+  const linkedEvent = eventRows[0] || {};
+  const eventAddress = (quote.event_address && String(quote.event_address).trim()) || linkedEvent.address || null;
   let logo = QUOTE_LOGO;
   if (settings.logo_url) {
     try {
@@ -2898,6 +3037,17 @@ async function sendQuoteEmailRoute({ headers, env, db, body, id }) {
     console.error("[quote-email] pdf failed", e?.message || e);
     return { status: 500, body: { ok: false, error: "pdf_failed", message: "לא הצלחנו להפיק את קובץ ה-PDF" } };
   }
+  const rawClient = String(quote.client_name || "").trim();
+  const rawDate = String(quote.event_date || linkedEvent.event_date || linkedEvent.start_date || "").slice(0, 10);
+  const formattedDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+    ? `${rawDate.slice(8, 10)}.${rawDate.slice(5, 7)}.${rawDate.slice(0, 4)}`
+    : "";
+  const rawVenue = String(quote.venue || linkedEvent.venue || "").trim();
+  const safeParts = [rawClient, formattedDate, rawVenue]
+    .map((p) => p.replace(/[\\/:*?"<>|\u0000-\u001F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const pdfFileName = `${safeParts.length ? safeParts.join(" ") : `הצעת-מחיר-${quote.quote_number}`}.pdf`;
+
   const senderId = userIdFromAuth(headers);
   let replyTo = env.INVITE_FROM_EMAIL || "a0525092333@gmail.com";
   if (senderId) {
@@ -2910,11 +3060,11 @@ async function sendQuoteEmailRoute({ headers, env, db, body, id }) {
   const html = emailShell({
     heading: `הצעת מחיר מס׳ ${quote.quote_number}`,
     bodyHtml: `
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${quote.client_name ? ` ${quote.client_name}` : ""},</p>
-    <p style="margin:0 0 12px;font-size:14px;line-height:1.7">מצורפת הצעת המחיר שלך כקובץ PDF.</p>
-    ${message ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;white-space:pre-wrap">${escapeHtml(message)}</p>` : ""}
-    <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">הקובץ המצורף: הצעת-מחיר-${escapeHtml(quote.quote_number)}.pdf</p>
-  `,
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">שלום${quote.client_name ? ` ${quote.client_name}` : ""},</p>
+      <p style="margin:0 0 12px;font-size:14px;line-height:1.7">מצורפת הצעת המחיר שלך כקובץ PDF.</p>
+      ${message ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;white-space:pre-wrap">${escapeHtml(message)}</p>` : ""}
+      <p style="margin:0;font-size:12px;line-height:1.7;color:#6b7280">הקובץ המצורף: ${escapeHtml(pdfFileName)}</p>
+    `,
   });
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -2927,7 +3077,7 @@ async function sendQuoteEmailRoute({ headers, env, db, body, id }) {
         subject,
         html,
         attachments: [
-          { filename: `הצעת-מחיר-${quote.quote_number}.pdf`, content: pdf.toString("base64") },
+          { filename: pdfFileName, content: pdf.toString("base64") },
         ],
       }),
     });
@@ -3210,7 +3360,7 @@ async function mergeClientsRoute({ headers, env, db, body }) {
         company = COALESCE(NULLIF(company,''), $4),
         address = COALESCE(NULLIF(address,''), $5),
         notes = COALESCE(NULLIF(notes,''), $6)
-      WHERE id = $7`,
+        WHERE id = $7`,
       params: [
         firstValue("contact_name"),
         firstValue("phone"),
@@ -3240,16 +3390,12 @@ async function mergeClientsRoute({ headers, env, db, body }) {
 }
 
 async function deleteEventRoute({ headers, env, db, id }) {
-  // Only the account owner (is_super_admin = owner email) may delete events —
-  // admins and the permissions matrix do NOT grant this.
   const caller = await verifyCaller(headers, env, "clients", "edit");
   if (!caller.ok && caller.status !== 403) return clientsDenied(caller);
   if (!caller.ok || caller.isAdmin !== true) {
     return { status: 403, body: { ok: false, error: "owner_only", message: "רק בעל החשבון יכול למחוק אירועים" } };
   }
   if (typeof id !== "string" || !BACKUP_UUID.test(id)) return { status: 400, body: { ok: false, error: "invalid", message: "חסר מזהה אירוע" } };
-  // Preserve owner-only authorization above; verified identity is audit provenance,
-  // not an additional module permission or a source of new deletion authority.
   const actor = await securityActor(headers, env, "clients", "edit", false);
   if (!actor.ok) return clientsDenied(actor);
   if (!actor.is_owner) return { status: 403, body: { ok: false, error: "owner_only", message: "רק בעל החשבון יכול למחוק אירועים" } };
@@ -3429,8 +3575,6 @@ async function passwordStatusRoute({ headers, env, db }) {
     if (session.status === 401) {
       return { status: 401, body: { ok: false, error: "unauthorized", message: "פג תוקף ההתחברות — התחבר מחדש" } };
     }
-    // Authenticated but no profile / not approved yet: not an error for the
-    // status check — the app shows the approval screen instead.
     return { status: 200, body: { ok: true, mustChangePassword: false, role: null } };
   }
   const rows = await db.query(`SELECT must_change_password, role FROM public.profiles WHERE id = $1`, [session.userId]);
@@ -3613,8 +3757,6 @@ async function saveQuoteRoute({ headers, env, db, body }) {
     });
   }
   if (typeof body?.fieldNotes === "string") {
-    // Internal notes for field crew / warehouse — server-only table, shown only
-    // in the employee event report, never on the quote print/PDF/email.
     statements.push({
       text: `INSERT INTO public.quote_field_notes (quote_id, notes, updated_at) VALUES ($1, $2, now())
              ON CONFLICT (quote_id) DO UPDATE SET notes = EXCLUDED.notes, updated_at = now()`,
@@ -3771,13 +3913,13 @@ async function eventReportRoute({ headers, env, db, id }) {
   if (!authorized && role === "crew") {
     const assigned = await db.query(
       `SELECT 1 FROM public.shifts s
-         JOIN public.crew_members cm ON cm.id = s.crew_member_id
-        WHERE s.event_id = $1 AND cm.user_id::text = $2
+       JOIN public.crew_members cm ON cm.id = s.crew_member_id
+       WHERE s.event_id = $1 AND cm.user_id::text = $2
        UNION ALL
        SELECT 1 FROM public.event_days d
-         JOIN public.event_day_crew dc ON dc.event_day_id = d.id
-         JOIN public.crew_members cm ON cm.id = dc.crew_member_id
-        WHERE d.event_id = $1 AND cm.user_id::text = $2
+       JOIN public.event_day_crew dc ON dc.event_day_id = d.id
+       JOIN public.crew_members cm ON cm.id = dc.crew_member_id
+       WHERE d.event_id = $1 AND cm.user_id::text = $2
        LIMIT 1`,
       [id, session.userId],
     );
@@ -3846,10 +3988,10 @@ async function eventReportRoute({ headers, env, db, id }) {
   );
   const dayCrewRows = await db.query(
     `SELECT d.id AS event_day_id, cm.full_name AS name, COALESCE(NULLIF(array_to_string(cm.crew_roles, ', '), ''), cm.role_title) AS role
-       FROM public.event_days d
-       JOIN public.event_day_crew dc ON dc.event_day_id = d.id
-       JOIN public.crew_members cm ON cm.id = dc.crew_member_id
-      WHERE d.event_id = $1`,
+     FROM public.event_days d
+     JOIN public.event_day_crew dc ON dc.event_day_id = d.id
+     JOIN public.crew_members cm ON cm.id = dc.crew_member_id
+     WHERE d.event_id = $1`,
     [id],
   );
   const dayCrewByDay = new Map();
@@ -3869,14 +4011,14 @@ async function eventReportRoute({ headers, env, db, id }) {
   }));
   const crew = await db.query(
     `SELECT DISTINCT cm.full_name AS name, COALESCE(NULLIF(array_to_string(cm.crew_roles, ', '), ''), cm.role_title) AS role
-       FROM public.shifts s JOIN public.crew_members cm ON cm.id = s.crew_member_id
-      WHERE s.event_id = $1
+     FROM public.shifts s JOIN public.crew_members cm ON cm.id = s.crew_member_id
+     WHERE s.event_id = $1
      UNION
      SELECT DISTINCT cm.full_name AS name, COALESCE(NULLIF(array_to_string(cm.crew_roles, ', '), ''), cm.role_title) AS role
-       FROM public.event_days d
-       JOIN public.event_day_crew dc ON dc.event_day_id = d.id
-       JOIN public.crew_members cm ON cm.id = dc.crew_member_id
-      WHERE d.event_id = $1`,
+     FROM public.event_days d
+     JOIN public.event_day_crew dc ON dc.event_day_id = d.id
+     JOIN public.crew_members cm ON cm.id = dc.crew_member_id
+     WHERE d.event_id = $1`,
     [id],
   );
 
@@ -3975,7 +4117,7 @@ function accountingTextDocument(text) {
     ["receipt", /קבלה/],
   ];
   let headline = -1;
-  const dates = (line) => [...line.matchAll(/\b(\d{2})[/.\-](\d{2})[/.\-](\d{4})\b/g)]
+  const dates = (line) => [...line.matchAll(/\b(\d{2})[/.-](\d{2})[/.-](\d{4})\b/g)]
     .map((match) => `${match[3]}-${match[2]}-${match[1]}`)
     .filter((date) => date >= "0001-01-01" && Number.isFinite(Date.parse(`${date}T00:00:00Z`))
       && new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) === date);
@@ -3998,13 +4140,12 @@ function accountingTextDocument(text) {
         || (tail.trim() === "" ? lines[index + 1]?.match(/^(?:מספר|מס["']?|#)\s*[:#-]?\s*(\d{1,18})\s*$/) : null);
       if (number) candidates.doc_number.push(number[1]);
     }
-    if (!payment && /^תאריך\s*(?:המסמך|מסמך|חשבונית|הפקה)?\s*[:\-]?\s*\d/.test(line)) candidates.document_date.push(...dates(line));
+    if (!payment && /^תאריך\s*(?:המסמך|מסמך|חשבונית|הפקה)?\s*[:-]?\s*\d/.test(line)) candidates.document_date.push(...dates(line));
     const customer = line.match(/^לכבוד\s*:?\s*(.*)$/);
     if (customer) {
       const name = customer[1] || lines[index + 1] || "";
       if (/[\u05d0-\u05ea]/.test(name) && !/[\d:@]|חשבונית|תאריך|מספר|הקצאה/.test(name) && name.length <= 250) candidates.customer.push(name);
     }
-    // Accept only a total/VAT label plus a single monetary value, not table headers or tax rates.
     for (const [key, label] of [["amount", /סה"כ|סך\s+הכל|סך\s+לתשלום/], ["vat", /מע"מ|מעמ/]]) {
       if (key === "vat" && payment) continue;
       const match = line.match(label);
@@ -4021,7 +4162,7 @@ function accountingTextDocument(text) {
     let customerHeader = false;
     for (const line of header) {
       if (/^לכבוד\s*:?/.test(line)) customerHeader = true;
-      if (/^\d{2}[/.\-]\d{2}[/.\-]\d{4}$/.test(line)) candidates.document_date.push(...dates(line));
+      if (/^\d{2}[/.-]\d{2}[/.-]\d{4}$/.test(line)) candidates.document_date.push(...dates(line));
       if (!customerHeader && /בע"מ|בעמ|שותפות\s+רשומה/.test(line) && !/לכבוד|[:@\d]/.test(line) && line.length <= 250) candidates.supplier.push(line);
     }
   }
@@ -4109,7 +4250,6 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
         return reply(200, { ok: true, name: rows[0].file_name, mime: rows[0].mime, data: rows[0].data.replace(/\s/g, "") });
       }
       if (method === "DELETE") {
-        // References intentionally survive file deletion for accounting records.
         const rows = await db.query("DELETE FROM public.event_accounting_files WHERE event_id = $1 AND id = $2 RETURNING id", [id, fileId]);
         return rows[0] ? reply(200, { ok: true }) : reply(404, { ok: false, error: "not_found" });
       }
@@ -4131,7 +4271,6 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
         if (file.confirmed_at) return reply(409, { ok: false, error: "scan_confirmed" });
         if (file.scan_status === "scanned" && !rescan) return reply(409, { ok: false, error: "scan_review_available" });
         if (!["pending", "scanned", "failed", "unavailable"].includes(file.scan_status)) return reply(409, { ok: false, error: "scan_not_allowed" });
-        // Client text is proposed metadata only. Confirmation remains the sole filing operation.
         let extraction = sourceText ? accountingTextDocument(sourceText) : {
           doc_type: null, doc_number: null, document_date: null, supplier: null, customer: null, amount: null, vat: null, warnings: [],
         };
@@ -4208,9 +4347,9 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
         }
         const rows = await db.query(
           `UPDATE public.event_accounting_files SET scan_status = $3, scan_result = $4::jsonb
-            WHERE event_id = $1 AND id = $2 AND confirmed_at IS NULL
-              AND (scan_status IN ('pending', 'failed', 'unavailable') OR (scan_status = 'scanned' AND $5::boolean))
-            RETURNING ${ACCOUNTING_FILE_FIELDS}`, [id, fileId, scanStatus, JSON.stringify(extraction), rescan],
+           WHERE event_id = $1 AND id = $2 AND confirmed_at IS NULL
+           AND (scan_status IN ('pending', 'failed', 'unavailable') OR (scan_status = 'scanned' AND $5::boolean))
+           RETURNING ${ACCOUNTING_FILE_FIELDS}`, [id, fileId, scanStatus, JSON.stringify(extraction), rescan],
         );
         if (!rows[0]) return reply(409, { ok: false, error: "scan_not_allowed" });
         return reply(200, { ok: true, file: accountingMetadata(rows[0]), scanSucceeded: scanStatus === "scanned", scanError });
@@ -4243,8 +4382,6 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
         const caller = await rpc("accounting_user_id", {});
         if (caller.error) return caller.error;
         if (typeof caller.value !== "string" || !caller.value || caller.value.length > 512) return reply(503, { ok: false, error: "auth_unavailable" });
-        // A separate statement after the lock gets a fresh snapshot of concurrent uploads.
-        // Fail closed if the runtime cannot provide an atomic transaction.
         if (typeof db.transaction !== "function") return reply(503, { ok: false, error: "server" });
         const results = await db.transaction([
           { text: "SELECT id FROM public.events WHERE id = $1 FOR UPDATE", params: [id] },
@@ -4263,13 +4400,12 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
       }
       const document = accountingDocument(body);
       if (!document) return reply(400, { ok: false, error: "invalid_document" });
-      // Never promote extraction fields automatically. Existing references are retained, not overwritten.
       const rows = await db.query(
         `WITH locked AS MATERIALIZED (
            SELECT * FROM public.event_accounting_files WHERE event_id = $1 AND id = $2 FOR UPDATE
          ), reference AS (
            INSERT INTO public.event_accounting_references AS r
-             (event_id, doc_type, doc_number, document_date, notes, created_by)
+           (event_id, doc_type, doc_number, document_date, notes, created_by)
            SELECT event_id, $3, $4, $5::date, $10, uploaded_by FROM locked WHERE $4::text IS NOT NULL
            ON CONFLICT (event_id, doc_type, doc_number) DO UPDATE SET doc_number = r.doc_number
            WHERE $11::boolean OR r.id = (SELECT reference_id FROM locked)
@@ -4280,11 +4416,11 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
              amount = $8::numeric, vat = $9::numeric, notes = $10, confirmed_at = now(),
              reference_id = (SELECT id FROM reference)
            FROM locked WHERE f.event_id = $1 AND f.id = $2
-             AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM reference))
+           AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM reference))
            RETURNING f.*
          ) SELECT ${ACCOUNTING_FILE_FIELDS} FROM saved`,
         [id, fileId, document.doc_type, document.doc_number, document.document_date, document.supplier,
-          document.customer, document.amount, document.vat, document.notes, body.allowDuplicate === true],
+         document.customer, document.amount, document.vat, document.notes, body.allowDuplicate === true],
       );
       if (!rows[0]) return reply(409, { ok: false, error: "duplicate_reference" });
       return reply(200, { ok: true, file: accountingMetadata(rows[0]) });
@@ -4306,7 +4442,6 @@ async function eventAccountingRoute({ method, headers, rawBody, json, env, db, i
     ]);
     return reply(200, { ok: true, event: events[0], finance, paperless, references, files: attachedFiles.map(accountingMetadata), scanAvailable: !!env.GEMINI_API_KEY });
   } catch (error) {
-    // Fixed codes only: upstream errors may contain tokens, SQL, or provider payloads.
     const sqlState = typeof error?.code === "string" && /^[0-9A-Z]{5}$/.test(error.code) ? error.code : null;
     console.error(errorCode, sqlState ?? "unknown");
     return reply(503, { ok: false, error: errorCode === "ACCOUNTING_AUTH_RPC_FAILED" ? "auth_unavailable" : sqlState === "42501" ? "accounting_storage_permission" : "server" });
@@ -4322,10 +4457,6 @@ export default async function ({ method, path, url, headers, rawBody, json, env,
   if (isBackup) console.log("[backup] request", method, path);
   if (path.startsWith("/api/quotes")) console.log("[quotes] request", method, path);
   try {
-    // Quote save/restore are registered first so no earlier branch can shadow
-    // them. POST /api/quotes/save is the client contract: it creates a quote
-    // when the event has none, or updates the existing one in place and
-    // snapshots the previous state into quote_versions.
     if (path === "/api/security/access" && method === "GET") return await securityAccessRoute({ headers, env });
     if (path === "/api/users/permission-reset-preview" && method === "GET") return await permissionResetRoute({ headers, env, preview: true });
     if (path === "/api/users/permission-reset" && method === "POST") return await permissionResetRoute({ headers, env, body: json() });
@@ -4391,3 +4522,4 @@ export default async function ({ method, path, url, headers, rawBody, json, env,
 }
 
 export { buildQuotePdf, buildClientMergeGroups, hashPassword, verifyPassword };
+// END OF FILE - server/routes.mjs
