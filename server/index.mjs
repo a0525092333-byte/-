@@ -643,6 +643,40 @@ async function handleSendQuoteWithCc({ headers, env, body, id, url }) {
   return { status: 200, body: { ok: true, to, cc: ccList } };
 }
 
+async function attachImagesToEventReport(eventId, result) {
+  if (!result || result.status !== 200 || !result.body?.ok || !UUID_RE.test(String(eventId || ""))) {
+    return result;
+  }
+  try {
+    const quoteRows = await db.query(
+      `SELECT id FROM public.quotes WHERE event_id = $1 ORDER BY (status = 'approved') DESC, created_at DESC LIMIT 1`,
+      [eventId],
+    );
+    const quoteId = quoteRows[0]?.id;
+    const imageRows = quoteId
+      ? await db.query(
+          `SELECT id::text AS id, mime, data_url, caption FROM public.quote_images WHERE quote_id = $1 ORDER BY position ASC, id ASC`,
+          [quoteId],
+        )
+      : [];
+    return {
+      ...result,
+      body: {
+        ...result.body,
+        images: imageRows.map((img) => ({
+          id: String(img.id),
+          data_url: img.data_url,
+          mime: img.mime || "image/jpeg",
+          caption: img.caption ?? null,
+        })),
+      },
+    };
+  } catch (err) {
+    console.error("[event-report] images read warning:", err?.message || err);
+    return { ...result, body: { ...result.body, images: [] } };
+  }
+}
+
 async function bootstrapAuthPermissions() {
   try {
     const owner = (await db.query("SELECT current_user AS u"))[0]?.u;
@@ -723,6 +757,7 @@ const server = http.createServer(async (req, res) => {
     let result;
     try {
       const quoteSendMatch = url.pathname.match(/^\/api\/quotes\/([^/]+)\/send-email$/);
+      const eventReportMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/report$/);
       if (url.pathname === "/api/quotes/cc-settings") {
         result = await handleQuoteCcSettings({ method: req.method || "GET", headers: req.headers, env: reqEnv, json, url });
       } else if (quoteSendMatch && req.method === "POST") {
@@ -750,6 +785,9 @@ const server = http.createServer(async (req, res) => {
           env: reqEnv,
           db,
         });
+        if (eventReportMatch && req.method === "GET") {
+          result = await attachImagesToEventReport(eventReportMatch[1], result);
+        }
       }
     } catch (err) {
       console.error("[server] api error:", err?.message || err);
@@ -768,6 +806,12 @@ const server = http.createServer(async (req, res) => {
 
   let filePath = path.join(distDir, url.pathname === "/" ? "index.html" : url.pathname);
   if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    const reqExt = path.extname(url.pathname).toLowerCase();
+    if (reqExt && reqExt !== ".html") {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      res.end("Asset not found");
+      return;
+    }
     filePath = path.join(distDir, "index.html");
   }
   if (!fs.existsSync(filePath)) {
@@ -776,7 +820,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const ext = path.extname(filePath).toLowerCase();
-  res.writeHead(200, { "content-type": MIME_TYPES[ext] || "application/octet-stream" });
+  const staticHeaders = { "content-type": MIME_TYPES[ext] || "application/octet-stream" };
+  if (ext === ".html") staticHeaders["cache-control"] = "no-cache";
+  res.writeHead(200, staticHeaders);
   fs.createReadStream(filePath).pipe(res);
 });
 
