@@ -1,17 +1,18 @@
 import * as React from "react";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import {
   Boxes,
-  Briefcase,
-  DatabaseBackup,
   CalendarDays,
+  ClipboardList,
   Clock,
+  DatabaseBackup,
   FileText,
   HardHat,
   KeyRound,
   LayoutDashboard,
   LogOut,
   MoreHorizontal,
+  PanelRightOpen,
   PartyPopper,
   Search,
   Settings,
@@ -33,7 +34,7 @@ import { Button } from "@/components/ui/button";
 const ICONS: Record<string, LucideIcon> = {
   dashboard: LayoutDashboard,
   calendar: CalendarDays,
-  office: Briefcase,
+  office: ClipboardList,
   backup: DatabaseBackup,
   clock: Clock,
   report: FileText,
@@ -59,28 +60,13 @@ const RESTRICTED_LABELS: Record<string, string> = {
   "/crew": "הכרטיס שלי",
 };
 
-function openOfficeBrowserWindow() {
-  const width = Math.min(1440, Math.max(960, window.screen.availWidth - 80));
-  const height = Math.min(920, Math.max(700, window.screen.availHeight - 80));
-  const left = Math.max(0, Math.round((window.screen.availWidth - width) / 2));
-  const top = Math.max(0, Math.round((window.screen.availHeight - height) / 2));
-  const popup = window.open(
-    "/office",
-    "nsmm-office-window",
-    `popup=yes,noopener,noreferrer,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`,
-  );
-  if (!popup) {
-    window.open("/office", "_blank", "noopener,noreferrer");
-  }
-}
-
 function useVisibleNav(
   can: (m: Module, a?: "view" | "edit") => boolean,
   isSuperAdmin: boolean,
   fullScope: boolean,
+  role: Profile["role"],
 ) {
   return React.useMemo(() => {
-    // Only the owner account bypasses the matrix.
     if (isSuperAdmin) return [...site.nav];
     if (!fullScope) {
       const allowed = new Set([
@@ -96,7 +82,13 @@ function useVisibleNav(
       ]);
       return site.nav
         .filter((item) => allowed.has(item.to) || (item.to === "/equipment" && can("equipment", "view")))
-        .map((item) => ({ ...item, label: RESTRICTED_LABELS[item.to] ?? item.label })) as unknown as NavEntry[];
+        .map((item) => ({
+          ...item,
+          label:
+            item.to === "/office" && (role === "warehouse" || can("office", "edit"))
+              ? "לוח תפעול ושיבוץ"
+              : (RESTRICTED_LABELS[item.to] ?? item.label),
+        })) as unknown as NavEntry[];
     }
     return site.nav.filter((item) => {
       if (item.module === "dashboard" || item.module === "settings") return true;
@@ -107,12 +99,13 @@ function useVisibleNav(
           can("calendar", "view") ||
           can("crew", "view") ||
           can("finance", "view") ||
-          can("equipment", "view")
+          can("equipment", "view") ||
+          can("office", "view")
         );
       }
       return can(item.module as Module, "view");
     });
-  }, [can, isSuperAdmin, fullScope]);
+  }, [can, isSuperAdmin, fullScope, role]);
 }
 
 function NavLink({ item, onNavigate, badge }: { item: NavEntry; onNavigate?: () => void; badge?: number }) {
@@ -136,25 +129,6 @@ function NavLink({ item, onNavigate, badge }: { item: NavEntry; onNavigate?: () 
   );
 }
 
-function NavButton({ item, onActivate, badge }: { item: NavEntry; onActivate: () => void; badge?: number }) {
-  const Icon = ICONS[item.icon] ?? LayoutDashboard;
-  return (
-    <button
-      type="button"
-      onClick={onActivate}
-      className="group flex min-h-11 w-full items-center gap-3 rounded-xl px-3 text-start text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40"
-    >
-      <Icon className="size-[18px] shrink-0" aria-hidden="true" />
-      <span className="truncate">{item.label}</span>
-      {badge ? (
-        <span className="ms-auto inline-flex min-w-5 items-center justify-center rounded-full bg-amber-500 px-1.5 text-[10px] font-bold text-white">
-          {badge}
-        </span>
-      ) : null}
-    </button>
-  );
-}
-
 export function AppShell({
   profile,
   isAdmin,
@@ -171,10 +145,29 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = React.useState(false);
+  const [boardFullscreen, setBoardFullscreen] = React.useState(false);
+  const location = useLocation();
   const navigate = useNavigate();
+  const isDispatchRoute = location.pathname === "/office" || location.pathname.startsWith("/office/");
+
+  React.useEffect(() => {
+    const onToggle = (e: Event) => {
+      const detail = (e as CustomEvent<{ fullscreen?: boolean }>).detail;
+      setBoardFullscreen((prev) => (typeof detail?.fullscreen === "boolean" ? detail.fullscreen : !prev));
+    };
+    window.addEventListener("nsmm:dispatch-fullscreen", onToggle);
+    return () => window.removeEventListener("nsmm:dispatch-fullscreen", onToggle);
+  }, []);
+
+  React.useEffect(() => {
+    if (!isDispatchRoute && boardFullscreen) {
+      setBoardFullscreen(false);
+    }
+  }, [isDispatchRoute, boardFullscreen]);
+
   const fullScope = isFullScope(profile, isAdmin);
   const canSearch = can("search");
-  const visibleNav = useVisibleNav(can, isSuperAdmin, fullScope);
+  const visibleNav = useVisibleNav(can, isSuperAdmin, fullScope, profile.role);
   const home = homeRouteFor(profile.role);
   const safeHome = can(home === "/attendance" ? "attendance" : "calendar", "view")
     ? home
@@ -199,7 +192,7 @@ export function AppShell({
   const canUsers = can("users", "view");
   const profilesQ = useProfiles(canUsers);
   const pendingCount = canUsers
-    ? (profilesQ.data ?? []).filter((profile) => profile.approval_status === "pending").length
+    ? (profilesQ.data ?? []).filter((p) => p.approval_status === "pending").length
     : 0;
 
   const primaryModule: Module = !fullScope
@@ -210,10 +203,10 @@ export function AppShell({
   const mobileNav = React.useMemo(() => {
     const priority = [
       safeHome,
-      "/calendar",
-      "/attendance",
-      "/events",
       "/office",
+      "/attendance",
+      "/calendar",
+      "/events",
       "/my-documents",
       `/${primaryModule === "clients" ? "clients" : primaryModule}`,
       "/clients",
@@ -236,64 +229,75 @@ export function AppShell({
     navigate({ to: "/login", search: { invite: undefined } });
   };
 
+  const hideSidebar = isDispatchRoute && boardFullscreen;
+
   return (
     <div className="min-h-dvh bg-background">
-      {/* Desktop sidebar — right side in RTL */}
-      <aside className="fixed inset-y-0 right-0 z-30 hidden w-64 flex-col border-l border-border bg-card lg:flex">
-        <div className="flex items-center gap-2.5 px-5 py-5">
-          <img src="/brand/logo.jpeg" alt="" className="h-8 w-auto shrink-0 rounded object-contain" />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-bold text-foreground">{site.name}</p>
-            <p className="truncate text-[11px] text-muted-foreground">{site.tagline}</p>
+      {!hideSidebar ? (
+        <aside className="fixed inset-y-0 right-0 z-30 hidden w-64 flex-col border-l border-border bg-card lg:flex">
+          <div className="flex items-center gap-2.5 px-5 py-5">
+            <img src="/brand/logo.jpeg" alt="" className="h-8 w-auto shrink-0 rounded object-contain" />
+            <div className="min-w-0">
+              <p className="truncate text-sm font-bold text-foreground">{site.name}</p>
+              <p className="truncate text-[11px] text-muted-foreground">{site.tagline}</p>
+            </div>
           </div>
-        </div>
-        {canSearch ? (
-          <div className="px-3 pb-2">
+          {canSearch ? (
+            <div className="px-3 pb-2">
+              <Link
+                to="/search"
+                className="flex min-h-11 items-center gap-2 rounded-xl border border-border bg-muted/40 px-3 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                <Search className="size-4" />
+                <span className="truncate">חיפוש בכל המערכת…</span>
+              </Link>
+            </div>
+          ) : null}
+          <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2" aria-label="ניווט ראשי">
+            {nav.map((item) => (
+              <NavLink key={item.to} item={item} badge={item.to === "/users" ? pendingCount : undefined} />
+            ))}
+          </nav>
+          <div className="border-t border-border p-3">
+            <div className="flex items-center gap-2.5 rounded-xl bg-muted/60 p-2.5">
+              <Avatar name={profile.full_name} />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-foreground">{profile.full_name}</p>
+                <p className="truncate text-xs text-muted-foreground">{ROLE_LABELS[isAdmin ? "admin" : profile.role] ?? profile.role}</p>
+              </div>
+              <button
+                type="button"
+                onClick={logout}
+                aria-label="התנתקות"
+                className="flex size-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-card hover:text-destructive focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40"
+              >
+                <LogOut className="size-4" />
+              </button>
+            </div>
             <Link
-              to="/search"
-              className="flex min-h-11 items-center gap-2 rounded-xl border border-border bg-muted/40 px-3 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              to="/set-password"
+              className="mt-2 flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-card hover:text-foreground"
             >
-              <Search className="size-4" />
-              <span className="truncate">חיפוש בכל המערכת…</span>
+              <KeyRound className="size-4" />
+              שינוי סיסמה
             </Link>
           </div>
-        ) : null}
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2" aria-label="ניווט ראשי">
-          {nav.map((item) =>
-            item.to === "/office" ? (
-              <NavButton key={item.to} item={item} onActivate={openOfficeBrowserWindow} />
-            ) : (
-              <NavLink key={item.to} item={item} badge={item.to === "/users" ? pendingCount : undefined} />
-            ),
-          )}
-        </nav>
-        <div className="border-t border-border p-3">
-          <div className="flex items-center gap-2.5 rounded-xl bg-muted/60 p-2.5">
-            <Avatar name={profile.full_name} />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-semibold text-foreground">{profile.full_name}</p>
-              <p className="truncate text-xs text-muted-foreground">{ROLE_LABELS[isAdmin ? "admin" : profile.role] ?? profile.role}</p>
-            </div>
-            <button
-              type="button"
-              onClick={logout}
-              aria-label="התנתקות"
-              className="flex size-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-card hover:text-destructive focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40"
-            >
-              <LogOut className="size-4" />
-            </button>
-          </div>
-          <Link
-            to="/set-password"
-            className="mt-2 flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-card hover:text-foreground"
-          >
-            <KeyRound className="size-4" />
-            שינוי סיסמה
-          </Link>
-        </div>
-      </aside>
+        </aside>
+      ) : (
+        <button
+          type="button"
+          onClick={() => {
+            setBoardFullscreen(false);
+            window.dispatchEvent(new CustomEvent("nsmm:dispatch-fullscreen-state", { detail: { fullscreen: false } }));
+          }}
+          className="fixed right-2 top-2 z-40 hidden items-center gap-1.5 rounded-lg border border-border bg-card/95 px-2.5 py-1.5 text-xs font-medium text-foreground shadow-sm hover:bg-muted lg:inline-flex"
+          title="הצג תפריט צד"
+        >
+          <PanelRightOpen className="size-4" />
+          תפריט
+        </button>
+      )}
 
-      {/* Mobile top bar */}
       <header className="sticky top-0 z-20 flex items-center justify-between border-b border-border bg-background/90 px-4 py-2.5 backdrop-blur lg:hidden">
         <div className="flex items-center gap-2">
           <img src="/brand/logo.jpeg" alt="" className="h-8 w-auto shrink-0 rounded object-contain" />
@@ -323,11 +327,18 @@ export function AppShell({
         </div>
       </header>
 
-      <main className="pb-[calc(var(--bottom-nav-height)+1rem)] lg:pr-64 lg:pb-8">
-        <div className="mx-auto w-full max-w-6xl px-4 py-5 sm:px-6 lg:px-8 lg:py-8">{children}</div>
+      <main className={`pb-[calc(var(--bottom-nav-height)+1rem)] lg:pb-6 ${hideSidebar ? "lg:pr-0" : "lg:pr-64"}`}>
+        <div
+          className={
+            isDispatchRoute
+              ? "mx-auto w-full max-w-none px-2.5 py-3 sm:px-4 lg:px-4 lg:py-3"
+              : "mx-auto w-full max-w-6xl px-4 py-5 sm:px-6 lg:px-8 lg:py-8"
+          }
+        >
+          {children}
+        </div>
       </main>
 
-      {/* Mobile bottom navigation */}
       <nav
         className="safe-bottom fixed inset-x-0 bottom-0 z-30 border-t border-border bg-card/95 backdrop-blur lg:hidden"
         aria-label="ניווט תחתון"
@@ -335,19 +346,6 @@ export function AppShell({
         <div className="flex w-full">
           {mobileNav.map((item) => {
             const Icon = ICONS[item.icon] ?? LayoutDashboard;
-            if (item.to === "/office") {
-              return (
-                <button
-                  key={item.to}
-                  type="button"
-                  onClick={openOfficeBrowserWindow}
-                  className="flex min-h-14 min-w-0 flex-1 flex-col items-center justify-center gap-0.5 px-0.5 text-[10px] font-medium leading-tight text-muted-foreground"
-                >
-                  <Icon className="size-5 shrink-0" aria-hidden="true" />
-                  <span className="w-full truncate text-center leading-tight">{item.label}</span>
-                </button>
-              );
-            }
             return (
               <Link
                 key={item.to}
@@ -374,25 +372,14 @@ export function AppShell({
 
       <Sheet open={moreOpen} onOpenChange={setMoreOpen} title="כל המודולים" description={site.tagline}>
         <div className="space-y-1">
-          {nav.map((item) =>
-            item.to === "/office" ? (
-              <NavButton
-                key={item.to}
-                item={item}
-                onActivate={() => {
-                  setMoreOpen(false);
-                  openOfficeBrowserWindow();
-                }}
-              />
-            ) : (
-              <NavLink
-                key={item.to}
-                item={item}
-                badge={item.to === "/users" ? pendingCount : undefined}
-                onNavigate={() => setMoreOpen(false)}
-              />
-            ),
-          )}
+          {nav.map((item) => (
+            <NavLink
+              key={item.to}
+              item={item}
+              badge={item.to === "/users" ? pendingCount : undefined}
+              onNavigate={() => setMoreOpen(false)}
+            />
+          ))}
         </div>
         <div className="mt-4 border-t border-border pt-4">
           <Link
@@ -412,3 +399,4 @@ export function AppShell({
     </div>
   );
 }
+// END OF FILE - src/components/app-shell.tsx
