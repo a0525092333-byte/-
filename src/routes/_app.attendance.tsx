@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { CalendarDays, Clock, FileText, Plus } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { CalendarDays, Car, ClipboardList, Clock, FileText, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/use-session";
-import { useEvents, useProfiles, useTimeEntries, useTimeEntryAdditions } from "@/hooks/use-data";
+import { useCrewMembers, useEvents, useProfiles, useTimeEntries, useTimeEntryAdditions } from "@/hooks/use-data";
 import { db } from "@/integrations/neon/client";
 import { ClockCard } from "@/components/attendance/clock-card";
 import { EntryDialog } from "@/components/attendance/entry-dialog";
@@ -11,6 +12,9 @@ import { AttendanceTable } from "@/components/attendance/attendance-table";
 import { ManualFlags } from "@/components/attendance/manual-flags";
 import { EmptyState, ErrorState, PageHeader, PageSkeleton, SectionCard, StatCard, StatusPill } from "@/components/shared";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Field } from "@/components/ui/controls";
+import { Dialog } from "@/components/ui/overlay";
 import { dateShort, money, todayISO, weekdayShort } from "@/lib/format";
 import {
   DAY_TYPE_LABELS,
@@ -22,7 +26,7 @@ import {
   n,
   nowTime,
 } from "@/lib/attendance";
-import type { TimeEntry } from "@/lib/types";
+import type { DispatchTask, DispatchTaskCrew, TimeEntry } from "@/lib/types";
 
 export const Route = createFileRoute("/_app/attendance")({ component: AttendancePage });
 
@@ -33,17 +37,29 @@ function AttendancePage() {
   const entriesQ = useTimeEntries(!!user?.id, undefined, isAdmin ? undefined : user?.id);
   const additionsQ = useTimeEntryAdditions(!!user?.id, isAdmin ? undefined : user?.id);
   const profilesQ = useProfiles(can("attendance", "view"));
-  const eventsQ = useEvents(canManage || can("clients") || can("calendar"));
+  const eventsQ = useEvents(Boolean(user?.id));
+  const crewQ = useCrewMembers(Boolean(user?.id));
+
   const [tab, setTab] = useState<"clock" | "team">("clock");
   const [busy, setBusy] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<TimeEntry | null>(null);
   const [month, setMonth] = useState(() => monthKeyOf(new Date()));
 
+  // חלונית דיווח ק״מ אוטומטית בסגירת משמרת לעובד שיצא עם רכבו האישי
+  const [kmPromptOpen, setKmPromptOpen] = useState(false);
+  const [pendingBreakMinutes, setPendingBreakMinutes] = useState(0);
+  const [kmInput, setKmInput] = useState("");
+  const [routeInput, setRouteInput] = useState("");
+
   const entries = entriesQ.data ?? [];
   const additions = additionsQ.data ?? [];
   const profiles = profilesQ.data ?? [];
   const events = eventsQ.data ?? [];
+  const myCrewMember = useMemo(
+    () => (crewQ.data ?? []).find((c) => c.user_id === user?.id) ?? null,
+    [crewQ.data, user?.id],
+  );
 
   const myEntries = useMemo(
     () => entries.filter((entry) => entry.user_id === user?.id),
@@ -53,6 +69,41 @@ function AttendancePage() {
     () => myEntries.find((entry) => entry.start_time && !entry.end_time) ?? null,
     [myEntries],
   );
+
+  const personalCarDispatchQ = useQuery({
+    queryKey: ["my_personal_car_dispatch", myCrewMember?.id, openEntry?.work_date],
+    enabled: Boolean(myCrewMember?.id && openEntry?.work_date),
+    queryFn: async () => {
+      if (!myCrewMember || !openEntry) return { usesPersonalCar: false, suggestedRoute: "", primaryEventId: null as string | null };
+      const { data: crewRows } = await db
+        .from<DispatchTaskCrew[]>("dispatch_task_crew")
+        .select("*")
+        .eq("crew_member_id", myCrewMember.id)
+        .eq("uses_personal_car", true);
+      const taskIds = (crewRows ?? []).map((r) => r.task_id);
+      if (!taskIds.length) return { usesPersonalCar: false, suggestedRoute: "", primaryEventId: null as string | null };
+      const { data: taskRows } = await db
+        .from<DispatchTask[]>("dispatch_tasks")
+        .select("*")
+        .eq("task_date", openEntry.work_date)
+        .in("id", taskIds);
+      const todayTasks = taskRows ?? [];
+      if (!todayTasks.length) return { usesPersonalCar: false, suggestedRoute: "", primaryEventId: null as string | null };
+      const stops = todayTasks
+        .map((t) => {
+          const ev = events.find((e) => e.id === t.event_id);
+          return t.sub_location?.trim() || ev?.venue?.trim() || t.title_override?.trim() || ev?.title?.trim() || "";
+        })
+        .filter(Boolean);
+      const suggestedRoute = stops.length ? `מחסן ← ${stops.join(" ← ")} ← חזרה` : "";
+      return {
+        usesPersonalCar: true,
+        suggestedRoute,
+        primaryEventId: todayTasks[0]?.event_id ?? null,
+      };
+    },
+  });
+
   const recent = useMemo(() => {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
@@ -61,6 +112,7 @@ function AttendancePage() {
       .filter((entry) => entry.work_date >= key)
       .sort((a, b) => b.work_date.localeCompare(a.work_date));
   }, [myEntries]);
+
   const monthEntries = useMemo(
     () => myEntries.filter((entry) => (entry.work_date ?? "").startsWith(month)),
     [myEntries, month],
@@ -116,6 +168,45 @@ function AttendancePage() {
     entriesQ.refetch();
   }
 
+  async function finalizeClockOut(breakMinutes: number, km = 0, routeText = "") {
+    if (!openEntry) return;
+    setBusy(true);
+    const rate = Number(profile?.km_rate) > 0 ? Number(profile?.km_rate) : 1.8;
+    const cleanKm = Math.max(0, Number(km) || 0);
+    const travelAmount = cleanKm > 0 ? Math.round(cleanKm * rate * 100) / 100 : n(openEntry.travel_amount);
+    const cleanRoute = routeText.trim();
+    const nextNote =
+      cleanKm > 0 && cleanRoute
+        ? [openEntry.note, `נסיעה ברכב אישי (${cleanKm} ק״מ): ${cleanRoute}`].filter(Boolean).join(" | ")
+        : openEntry.note;
+
+    const patch: Record<string, unknown> = {
+      end_time: nowTime(),
+      break_minutes: breakMinutes,
+    };
+    if (cleanKm > 0) {
+      patch.travel_km = cleanKm;
+      patch.travel_amount = travelAmount;
+      patch.travel_route = cleanRoute || null;
+      patch.note = nextNote;
+      if (!openEntry.event_id && personalCarDispatchQ.data?.primaryEventId) {
+        patch.event_id = personalCarDispatchQ.data.primaryEventId;
+      }
+    }
+
+    const { error } = await db.from("time_entries").update(patch).eq("id", openEntry.id);
+    setBusy(false);
+    if (error) {
+      toast.error("לא הצלחנו לסיים את המשמרת. נסה שוב.");
+      return;
+    }
+    setKmPromptOpen(false);
+    setKmInput("");
+    setRouteInput("");
+    toast.success(cleanKm > 0 ? `המשמרת הסתיימה ונרשמו ${cleanKm} ק״מ להחזר בשכר` : "המשמרת הסתיימה");
+    entriesQ.refetch();
+  }
+
   async function clockOut(breakMinutes: number) {
     if (!openEntry) return;
     const total = minutesBetween(openEntry.start_time, nowTime());
@@ -123,18 +214,22 @@ function AttendancePage() {
       toast.error("דקות ההפסקה גדולות משעות המשמרת");
       return;
     }
-    setBusy(true);
-    const { error } = await db
-      .from("time_entries")
-      .update({ end_time: nowTime(), break_minutes: breakMinutes })
-      .eq("id", openEntry.id);
-    setBusy(false);
-    if (error) {
-      toast.error("לא הצלחנו לסיים את המשמרת. נסה שוב.");
+    if (personalCarDispatchQ.data?.usesPersonalCar) {
+      setPendingBreakMinutes(breakMinutes);
+      setKmInput("");
+      setRouteInput(personalCarDispatchQ.data.suggestedRoute || "");
+      setKmPromptOpen(true);
       return;
     }
-    toast.success("המשמרת הסתיימה");
-    entriesQ.refetch();
+    await finalizeClockOut(breakMinutes, 0, "");
+  }
+
+  function openAdhocPersonalCarOut() {
+    if (!openEntry) return;
+    setPendingBreakMinutes(0);
+    setKmInput("");
+    setRouteInput(personalCarDispatchQ.data?.suggestedRoute || "");
+    setKmPromptOpen(true);
   }
 
   async function setApproval(entry: TimeEntry, approved: boolean) {
@@ -202,6 +297,11 @@ function AttendancePage() {
           </Button>
         ) : null}
         <Button asChild variant="outline">
+          <Link to="/office">
+            <ClipboardList className="size-4" /> {isAdmin ? "לוח תפעול ושיבוץ" : "הסידור והזמינות שלי"}
+          </Link>
+        </Button>
+        <Button asChild variant="outline">
           <Link to="/attendance-report">
             <FileText className="size-4" /> דוח חודשי
           </Link>
@@ -216,13 +316,22 @@ function AttendancePage() {
       {tab === "clock" || !canManage ? (
         <div className="space-y-5">
           {profile?.role === "crew" || can("attendance", "edit") ? (
-            <ClockCard openEntry={openEntry} busy={busy} onClockIn={clockIn} onClockOut={clockOut} />
+            <div className="space-y-2">
+              <ClockCard openEntry={openEntry} busy={busy} onClockIn={clockIn} onClockOut={clockOut} />
+              {openEntry ? (
+                <div className="flex justify-end">
+                  <Button type="button" variant="outline" size="sm" onClick={openAdhocPersonalCarOut}>
+                    <Car className="size-4 text-indigo-600" /> סיום משמרת + דיווח ק״מ ברכב אישי
+                  </Button>
+                </div>
+              ) : null}
+            </div>
           ) : null}
 
           <div className="grid gap-3 sm:grid-cols-3">
             <StatCard label="שעות בחודש" value={formatMinutes(monthMinutes)} icon={Clock} />
             <StatCard label="תוספות כספיות" value={money(monthAdditions)} icon={FileText} tone="amber" />
-            <StatCard label="קילומטרים" value={`${monthTravelKm.toLocaleString("he-IL")} ק"מ`} icon={CalendarDays} tone="blue" />
+            <StatCard label="קילומטרים ברכב אישי" value={`${monthTravelKm.toLocaleString("he-IL")} ק"מ`} icon={Car} tone="blue" />
           </div>
 
           <SectionCard
@@ -255,8 +364,9 @@ function AttendancePage() {
                         </div>
                         <p className="mt-1 text-xs text-muted-foreground">
                           {DAY_TYPE_LABELS[entry.day_type]} · {formatMinutes(entryMinutes(entry))} · {adds.length} תוספות
-                          {n(entry.travel_km) ? ` · ${n(entry.travel_km)} ק"מ` : ""}
+                          {n(entry.travel_km) ? ` · ${n(entry.travel_km)} ק"מ ברכב אישי` : ""}
                         </p>
+                        {entry.travel_route ? <p className="mt-0.5 text-xs text-indigo-700">מסלול: {entry.travel_route}</p> : null}
                         {entry.note ? <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">{entry.note}</p> : null}
                         <ManualFlags entry={entry} profiles={isAdmin ? profiles : profile ? [profile] : []} />
                       </div>
@@ -282,6 +392,60 @@ function AttendancePage() {
         />
       )}
 
+      {/* חלונית מהירה לדיווח ק״מ ברכב פרטי בעת סיום משמרת */}
+      <Dialog
+        open={kmPromptOpen}
+        onOpenChange={(v) => { if (!busy) setKmPromptOpen(v); }}
+        title="דיווח ק״מ ברכב פרטי"
+        description="סומן שיצאת היום עם רכבך האישי — הזן כמה ק״מ נסעת כדי שייכנס אוטומטית לשכר"
+        size="sm"
+        footer={
+          <div className="flex flex-wrap justify-between gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => finalizeClockOut(pendingBreakMinutes, 0, "")}
+            >
+              סיים ללא ק״מ
+            </Button>
+            <Button
+              type="button"
+              disabled={busy}
+              onClick={() => finalizeClockOut(pendingBreakMinutes, Number(kmInput) || 0, routeInput)}
+            >
+              {busy ? "שומר…" : "אישור וסיום משמרת"}
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <Field label="כמה ק״מ נסעת היום לטובת האירוע? *" htmlFor="clockout-km">
+            <Input
+              id="clockout-km"
+              type="number"
+              min="0"
+              step="1"
+              inputMode="numeric"
+              autoFocus
+              value={kmInput}
+              onChange={(e) => setKmInput(e.target.value)}
+              placeholder="לדוגמה: 85"
+              className="num h-12 text-lg font-bold"
+            />
+          </Field>
+          <Field label="מאיפה לאיפה נסעת? (אופציונלי)" htmlFor="clockout-route">
+            <Input
+              id="clockout-route"
+              value={routeInput}
+              onChange={(e) => setRouteInput(e.target.value)}
+              placeholder="לדוגמה: מחסן ← מלון ביאנקיני ← חזרה"
+              className="h-10 text-sm"
+            />
+          </Field>
+        </div>
+      </Dialog>
+
       <EntryDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
@@ -299,3 +463,4 @@ function AttendancePage() {
     </div>
   );
 }
+// END OF FILE - src/routes/_app.attendance.tsx
