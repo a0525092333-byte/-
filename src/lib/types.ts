@@ -500,4 +500,37 @@ export type CrewUnavailability = {
   created_by: string | null;
   created_at: string;
 };
+
+export type EquipmentChangeType = "add" | "remove" | "swap";
+export type EquipmentChangeStatus = "pending" | "updated_quote" | "no_charge" | "dismissed";
+
+export type EventEquipmentChange = {
+  id: string;
+  event_id: string;
+  quote_id: string | null;
+  change_type: EquipmentChangeType;
+  item_name: string;
+  quantity: number;
+  unit: string | null;
+  reason: string | null;
+  source: "warehouse" | "field";
+  status: EquipmentChangeStatus;
+  reported_by: string | null;
+  reported_by_name: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  resolution_note: string | null;
+  created_at: string;
+};
+
+export type EventFieldPhoto = {
+  id: string;
+  event_id: string;
+  data_url: string;
+  mime: string;
+  caption: string | null;
+  uploaded_by: string | null;
+  uploaded_by_name: string | null;
+  created_at: string;
+};
 // END OF FILE - src/lib/types.ts
