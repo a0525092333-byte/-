@@ -7,6 +7,7 @@ import {
   Car,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Crown,
   FileText,
   Maximize2,
@@ -62,12 +63,52 @@ function addDays(d: Date, n: number): Date {
   return c;
 }
 
+function normalizeHm(t: string | null | undefined): string | null {
+  if (!t) return null;
+  const clean = String(t).trim().slice(0, 5);
+  return /^\d{2}:\d{2}$/.test(clean) ? clean : null;
+}
+
+function toMinutes(hm: string): number {
+  const [h, m] = hm.split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+function taskPrimaryTime(task: DispatchTask): string | null {
+  return normalizeHm(task.warehouse_time) ?? normalizeHm(task.start_time) ?? normalizeHm(task.end_time);
+}
+
+function compareTasksBySchedule(a: DispatchTask, b: DispatchTask): number {
+  const aStart = taskPrimaryTime(a) ?? "99:99";
+  const bStart = taskPrimaryTime(b) ?? "99:99";
+  if (aStart !== bStart) return aStart.localeCompare(bStart);
+  const aEnd = normalizeHm(a.end_time) ?? "99:99";
+  const bEnd = normalizeHm(b.end_time) ?? "99:99";
+  if (aEnd !== bEnd) return aEnd.localeCompare(bEnd);
+  if ((a.sort_order ?? 0) !== (b.sort_order ?? 0)) return (a.sort_order ?? 0) - (b.sort_order ?? 0);
+  return (a.created_at || "").localeCompare(b.created_at || "");
+}
+
+function formatTaskScheduleHeader(task: DispatchTask): string | null {
+  const wh = normalizeHm(task.warehouse_time);
+  const st = normalizeHm(task.start_time);
+  const en = normalizeHm(task.end_time);
+  const first = wh ?? st;
+  if (first && en) return `${first}–${en}`;
+  if (wh && st && wh !== st) return `${wh} (${st})`;
+  if (first) return first;
+  if (en) return `עד ${en}`;
+  return null;
+}
+
 function timesOverlap(aStart: string | null, aEnd: string | null, bStart: string | null, bEnd: string | null): boolean {
-  if (!aStart || !bStart) return true;
-  const s1 = aStart.slice(0, 5);
-  const e1 = (aEnd || "23:59").slice(0, 5);
-  const s2 = bStart.slice(0, 5);
-  const e2 = (bEnd || "23:59").slice(0, 5);
+  const s1Str = normalizeHm(aStart);
+  const s2Str = normalizeHm(bStart);
+  if (!s1Str || !s2Str) return false;
+  const s1 = toMinutes(s1Str);
+  const e1 = aEnd && normalizeHm(aEnd) ? Math.max(s1 + 15, toMinutes(normalizeHm(aEnd)!)) : s1 + 120;
+  const s2 = toMinutes(s2Str);
+  const e2 = bEnd && normalizeHm(bEnd) ? Math.max(s2 + 15, toMinutes(normalizeHm(bEnd)!)) : s2 + 120;
   return s1 < e2 && s2 < e1;
 }
 
@@ -288,7 +329,7 @@ export function OfficeBoard() {
     tasksByDay.set(t.task_date, list);
   }
   for (const list of tasksByDay.values()) {
-    list.sort((a, b) => (a.warehouse_time || a.start_time || "99:99").localeCompare(b.warehouse_time || b.start_time || "99:99"));
+    list.sort(compareTasksBySchedule);
   }
 
   const tasksByEvent = new Map<string, DispatchTask[]>();
@@ -533,7 +574,11 @@ export function OfficeBoard() {
   return (
     <div className="space-y-2">
       {/* סרגל שליטה עליון קומפקטי */}
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-3 py-2 shadow-xs">
+      <div
+        className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-3 py-2 shadow-xs ${
+          fullscreen ? "lg:ps-24" : ""
+        }`}
+      >
         <div className="flex flex-wrap items-center gap-1.5">
           <h1 className="me-2 text-base font-extrabold text-foreground">לוח תפעול ושיבוץ</h1>
           <Button type="button" variant="outline" size="icon" className="size-8" onClick={() => setWeekStart((d) => addDays(d, -7))} aria-label="שבוע קודם">
@@ -554,7 +599,7 @@ export function OfficeBoard() {
           <Button type="button" variant="outline" size="icon" className="size-8" onClick={() => setWeekStart((d) => addDays(d, 7))} aria-label="שבוע הבא">
             <ChevronLeft className="size-4" />
           </Button>
-          <span className="px-1.5 text-xs font-semibold text-muted-foreground">
+          <span className="px-1.5 text-xs font-semibold text-muted-foreground" dir="ltr">
             {dateShort(boardDays[0])} – {dateShort(boardDays[boardDays.length - 1])}
           </span>
         </div>
@@ -736,7 +781,7 @@ export function OfficeBoard() {
                       ) : null}
                     </div>
 
-                    {/* כרטיסיות סופר-דחוסות עם סימן מים — 10+ ביום ללא גלילה פנימית */}
+                    {/* כרטיסיות מסודרות אוטומטית מהשעה המוקדמת ביותר למעלה */}
                     <div className="flex-1 space-y-1 p-1">
                       {dayTasks.map((task) => {
                         const meta = TASK_TYPE_META[task.task_type];
@@ -746,11 +791,8 @@ export function OfficeBoard() {
                           ...(task.extra_vehicle_ids ?? []).map((vid) => vehicleMap.get(vid)?.name),
                         ].filter(Boolean);
                         const conflict = hasTaskConflict(task);
-                        const timeLabel = task.warehouse_time
-                          ? `${timeShort(task.warehouse_time)}${task.end_time ? `–${timeShort(task.end_time)}` : ""}`
-                          : task.start_time
-                            ? timeShort(task.start_time)
-                            : "";
+                        const scheduleHeader = formatTaskScheduleHeader(task);
+                        const fullTitle = taskDisplayTitle(task, eventsMap);
 
                         return (
                           <div
@@ -759,6 +801,7 @@ export function OfficeBoard() {
                               e.stopPropagation();
                               openEditTask(task);
                             }}
+                            title={fullTitle}
                             className={`group relative cursor-pointer overflow-hidden rounded-lg border border-border/80 px-2 py-1.5 transition-shadow hover:shadow-sm ${meta.border}`}
                           >
                             <span
@@ -769,31 +812,45 @@ export function OfficeBoard() {
                             </span>
 
                             <div className="relative space-y-0.5">
-                              <div className="flex items-start justify-between gap-1">
-                                <p className="line-clamp-1 text-xs font-bold leading-tight text-foreground">
-                                  {conflict ? <AlertTriangle className="me-0.5 inline size-3 text-red-600" /> : null}
-                                  {taskDisplayTitle(task, eventsMap)}
-                                </p>
-                                <div className="flex shrink-0 items-center gap-0.5">
-                                  {timeLabel ? (
-                                    <span className="num rounded bg-background/85 px-1 text-[10px] font-bold text-foreground">
-                                      {timeLabel}
+                              {/* קומה עליונה (כותרת לו״ז): שעות המשימה בראש הכרטיס + כפתור וואטסאפ */}
+                              <div className="flex items-center justify-between gap-1">
+                                <div className="flex min-w-0 items-center gap-1">
+                                  {conflict ? (
+                                    <span title="חפיפת שעות של רכב או איש צוות במשימה אחרת באותו יום">
+                                      <AlertTriangle className="size-3 shrink-0 text-red-600" />
                                     </span>
                                   ) : null}
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      sendSingleTaskWa(task);
-                                    }}
-                                    className="rounded p-0.5 text-emerald-700 hover:bg-emerald-100"
-                                    title="שלח משימה בוואטסאפ לראש הצוות"
-                                  >
-                                    <MessageCircle className="size-3" />
-                                  </button>
+                                  {scheduleHeader ? (
+                                    <span
+                                      dir="ltr"
+                                      className="num inline-flex items-center gap-1 rounded bg-background/90 px-1.5 py-0.5 text-[10px] font-extrabold leading-none text-foreground shadow-2xs"
+                                    >
+                                      <Clock className="size-2.5 text-muted-foreground" />
+                                      {scheduleHeader}
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] font-medium text-muted-foreground/80">ללא שעה</span>
+                                  )}
                                 </div>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    sendSingleTaskWa(task);
+                                  }}
+                                  className="shrink-0 rounded p-0.5 text-emerald-700 hover:bg-emerald-100"
+                                  title="שלח משימה בוואטסאפ לראש הצוות"
+                                >
+                                  <MessageCircle className="size-3" />
+                                </button>
                               </div>
 
+                              {/* קומה שנייה: שם האירוע / פירוט המיקום לרוחב מלא ללא הסתרה */}
+                              <p className="line-clamp-2 text-xs font-bold leading-snug text-foreground">
+                                {fullTitle}
+                              </p>
+
+                              {/* קומה שלישית: רכבים + שמות אנשי הצוות */}
                               <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-tight text-muted-foreground">
                                 {vNames.length > 0 ? (
                                   <span className="font-semibold text-foreground/85">{vNames.join("+")}</span>
