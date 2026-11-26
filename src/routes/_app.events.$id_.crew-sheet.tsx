@@ -1,21 +1,22 @@
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { ArrowRight, Printer } from "lucide-react";
+import { ArrowRight, Printer, X } from "lucide-react";
 import { useSession } from "@/hooks/use-session";
 import { useCompanySettings } from "@/hooks/use-data";
 import { Button } from "@/components/ui/button";
 import { ErrorState, LtrText, NoAccess, PageSkeleton } from "@/components/shared";
 import { dateLong, num, sameDisplayName, timeShort, weekdayShort } from "@/lib/format";
-import { fetchEventReport } from "@/lib/event-report";
+import { fetchEventReport, type EventReportImage } from "@/lib/event-report";
 import { isMultiDayEvent } from "@/lib/events";
 
 export const Route = createFileRoute("/_app/events/$id_/crew-sheet")({ component: EventReportPage });
 
 function EventReportPage() {
   const { id } = Route.useParams();
-  const { can, isAdmin } = useSession();
+  const { can } = useSession();
   const settingsQ = useCompanySettings(true);
+  const [zoomImage, setZoomImage] = useState<EventReportImage | null>(null);
   const reportQ = useQuery({
     queryKey: ["event_report", id],
     queryFn: async () => {
@@ -43,6 +44,7 @@ function EventReportPage() {
   const days = report.days ?? [];
   const sections = report.sections ?? [];
   const crew = report.crew ?? [];
+  const images = report.images ?? [];
   const settings = settingsQ.data;
   const canCreateQuote = can("quotes", "edit");
   const multiDay = isMultiDayEvent(event, days);
@@ -77,7 +79,11 @@ function EventReportPage() {
       <div className="quote-document mx-auto max-w-[210mm] bg-white p-6 text-black shadow-sm sm:p-10 print:max-w-none print:p-0 print:shadow-none">
         <div className="border-b-2 border-black pb-3">
           <div className="flex justify-center">
-            <img src="/brand/logo-print.png" alt="" className="brand-logo-print-lg" />
+            {settings?.logo_url ? (
+              <img src={settings.logo_url} alt="" className="brand-logo-print-lg" />
+            ) : (
+              <img src="/brand/logo-print.png" alt="" className="brand-logo-print-lg" />
+            )}
           </div>
           <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div className="text-start">
@@ -222,6 +228,33 @@ function EventReportPage() {
           )}
         </div>
 
+        {images.length ? (
+          <div className="mt-5">
+            <h2 className="mb-2 text-base font-bold">תמונות וסקיצות לאירוע</h2>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {images.map((image, index) => (
+                <figure key={image.id || index} className="break-inside-avoid rounded border border-gray-300 p-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setZoomImage(image)}
+                    className="block w-full cursor-zoom-in print:cursor-default"
+                    aria-label={image.caption || `הגדלת תמונה ${index + 1}`}
+                  >
+                    <img
+                      src={image.data_url}
+                      alt={image.caption || `תמונה ${index + 1}`}
+                      className="max-h-52 w-full rounded object-contain print:max-h-60"
+                    />
+                  </button>
+                  {image.caption ? (
+                    <figcaption className="mt-1 text-center text-xs text-gray-700">{image.caption}</figcaption>
+                  ) : null}
+                </figure>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
         {event.field_notes ? (
           <div className="mt-5 rounded border-2 border-gray-800 p-3">
             <h2 className="mb-2 text-base font-bold">הערות לצוות שטח ומחסנאי</h2>
@@ -252,6 +285,34 @@ function EventReportPage() {
           )}
         </div>
       </div>
+
+      {zoomImage ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="print-hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setZoomImage(null)}
+        >
+          <div className="relative max-h-[90vh] max-w-4xl" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              onClick={() => setZoomImage(null)}
+              className="absolute -top-10 end-0 inline-flex items-center gap-1 rounded-md bg-white/90 px-2.5 py-1 text-xs font-semibold text-black hover:bg-white"
+            >
+              <X className="size-4" /> סגירה
+            </button>
+            <img
+              src={zoomImage.data_url}
+              alt={zoomImage.caption || "תמונה מוגדלת"}
+              className="max-h-[82vh] w-auto rounded-lg bg-white object-contain shadow-xl"
+            />
+            {zoomImage.caption ? (
+              <p className="mt-2 text-center text-sm font-medium text-white">{zoomImage.caption}</p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
+// END OF FILE - src/routes/_app.events.$id_.crew-sheet.tsx
