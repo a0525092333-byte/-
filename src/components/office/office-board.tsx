@@ -13,6 +13,7 @@ import {
   Maximize2,
   MessageCircle,
   Minimize2,
+  PackagePlus,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
@@ -34,6 +35,7 @@ import { assignableCrew } from "@/lib/crew";
 import {
   CrewSelfServiceView,
   DailyWhatsappDialog,
+  EquipmentChangeDialog,
   TASK_ROLE_OPTIONS,
   TASK_TYPE_META,
   UnavailabilityDialog,
@@ -183,6 +185,7 @@ export function OfficeBoard() {
   const [deleteTarget, setDeleteTarget] = useState<DispatchTask | null>(null);
   const [waDialogOpen, setWaDialogOpen] = useState(false);
   const [unavailOpen, setUnavailOpen] = useState(false);
+  const [eqChangeEvent, setEqChangeEvent] = useState<{ id: string; title: string } | null>(null);
 
   useEffect(() => {
     const onFsState = (e: Event) => {
@@ -271,6 +274,8 @@ export function OfficeBoard() {
     qc.invalidateQueries({ queryKey: ["dispatch_task_crew"] });
     qc.invalidateQueries({ queryKey: ["crew_unavailability"] });
     qc.invalidateQueries({ queryKey: ["company_vehicles"] });
+    qc.invalidateQueries({ queryKey: ["pending_equipment_changes"] });
+    qc.invalidateQueries({ queryKey: ["event_equipment_changes"] });
   };
 
   if (!canAccess) return <NoAccess moduleLabel="לוח תפעול ושיבוץ" />;
@@ -310,6 +315,7 @@ export function OfficeBoard() {
         crewMap={crewMap}
         vehicleMap={vehicleMap}
         userId={user?.id}
+        userName={profile?.full_name}
         onRefresh={refreshAll}
       />
     );
@@ -573,7 +579,6 @@ export function OfficeBoard() {
 
   return (
     <div className="space-y-2">
-      {/* סרגל שליטה עליון קומפקטי */}
       <div
         className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-3 py-2 shadow-xs ${
           fullscreen ? "lg:ps-24" : ""
@@ -649,7 +654,6 @@ export function OfficeBoard() {
         </div>
       </div>
 
-      {/* שני פסי משאבים חיים ליום הנבחר: שורה 1 רכבים, שורה 2 זמינות צוות */}
       <div className="space-y-1.5 rounded-xl border border-border bg-card px-3 py-2 shadow-xs">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-[11px] font-bold text-muted-foreground">
@@ -725,7 +729,6 @@ export function OfficeBoard() {
         </div>
       </div>
 
-      {/* אזור מרכזי: לוח הימים + בנק האירועים מהמשרד */}
       <div className="flex flex-col gap-2.5 xl:flex-row">
         <div className="min-w-0 flex-1 space-y-2.5">
           {[boardDays.slice(0, 7), ...(twoWeeks ? [boardDays.slice(7, 14)] : [])].map((weekSlice, rowIdx) => (
@@ -781,7 +784,6 @@ export function OfficeBoard() {
                       ) : null}
                     </div>
 
-                    {/* כרטיסיות מסודרות אוטומטית מהשעה המוקדמת ביותר למעלה */}
                     <div className="flex-1 space-y-1 p-1">
                       {dayTasks.map((task) => {
                         const meta = TASK_TYPE_META[task.task_type];
@@ -812,7 +814,6 @@ export function OfficeBoard() {
                             </span>
 
                             <div className="relative space-y-0.5">
-                              {/* קומה עליונה (כותרת לו״ז): שעות המשימה בראש הכרטיס + כפתור וואטסאפ */}
                               <div className="flex items-center justify-between gap-1">
                                 <div className="flex min-w-0 items-center gap-1">
                                   {conflict ? (
@@ -832,25 +833,38 @@ export function OfficeBoard() {
                                     <span className="text-[10px] font-medium text-muted-foreground/80">ללא שעה</span>
                                   )}
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    sendSingleTaskWa(task);
-                                  }}
-                                  className="shrink-0 rounded p-0.5 text-emerald-700 hover:bg-emerald-100"
-                                  title="שלח משימה בוואטסאפ לראש הצוות"
-                                >
-                                  <MessageCircle className="size-3" />
-                                </button>
+                                <div className="flex shrink-0 items-center gap-0.5">
+                                  {task.event_id && canEditBoard ? (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setEqChangeEvent({ id: task.event_id!, title: fullTitle });
+                                      }}
+                                      className="rounded p-0.5 text-indigo-700 hover:bg-indigo-100"
+                                      title="עדכון / שינוי ציוד לאירוע (+/-) והתראה למשרד"
+                                    >
+                                      <PackagePlus className="size-3" />
+                                    </button>
+                                  ) : null}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      sendSingleTaskWa(task);
+                                    }}
+                                    className="rounded p-0.5 text-emerald-700 hover:bg-emerald-100"
+                                    title="שלח משימה בוואטסאפ לראש הצוות"
+                                  >
+                                    <MessageCircle className="size-3" />
+                                  </button>
+                                </div>
                               </div>
 
-                              {/* קומה שנייה: שם האירוע / פירוט המיקום לרוחב מלא ללא הסתרה */}
                               <p className="line-clamp-2 text-xs font-bold leading-snug text-foreground">
                                 {fullTitle}
                               </p>
 
-                              {/* קומה שלישית: רכבים + שמות אנשי הצוות */}
                               <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-tight text-muted-foreground">
                                 {vNames.length > 0 ? (
                                   <span className="font-semibold text-foreground/85">{vNames.join("+")}</span>
@@ -888,7 +902,6 @@ export function OfficeBoard() {
           ))}
         </div>
 
-        {/* בנק אירועים מהמשרד — מסודר כרונולוגית לפי ימים עם תאריכים ברורים */}
         {bankOpen ? (
           <aside className="w-full shrink-0 rounded-xl border border-border bg-card p-2.5 shadow-xs xl:w-72">
             <div className="mb-2 flex items-center justify-between gap-1 border-b border-border pb-2">
@@ -945,15 +958,30 @@ export function OfficeBoard() {
                               {ev.start_time ? ` · ${timeShort(ev.start_time)}` : ""}
                               {multiDay ? ` עד ${dateShort(ev.end_date).slice(0, 5)}` : ""}
                             </span>
-                            <Link
-                              to="/events/$id/crew-sheet"
-                              params={{ id: ev.id }}
-                              onClick={(e) => e.stopPropagation()}
-                              className="text-muted-foreground hover:text-primary"
-                              title="דוח אירוע"
-                            >
-                              <FileText className="size-3.5" />
-                            </Link>
+                            <div className="flex items-center gap-1">
+                              {canEditBoard ? (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEqChangeEvent({ id: ev.id, title: ev.title });
+                                  }}
+                                  className="text-muted-foreground hover:text-indigo-600"
+                                  title="עדכון / שינוי ציוד לאירוע (+/-)"
+                                >
+                                  <PackagePlus className="size-3.5" />
+                                </button>
+                              ) : null}
+                              <Link
+                                to="/events/$id/crew-sheet"
+                                params={{ id: ev.id }}
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-muted-foreground hover:text-primary"
+                                title="דוח אירוע"
+                              >
+                                <FileText className="size-3.5" />
+                              </Link>
+                            </div>
                           </div>
 
                           <p className="mt-1 truncate text-xs font-bold text-foreground">{ev.title}</p>
@@ -993,7 +1021,6 @@ export function OfficeBoard() {
         ) : null}
       </div>
 
-      {/* חלון יצירה / עריכת משימת תפעול */}
       <Dialog
         open={editorOpen}
         onOpenChange={(v) => { if (!saving) setEditorOpen(v); }}
@@ -1002,7 +1029,7 @@ export function OfficeBoard() {
         size="lg"
         footer={
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
+            <div className="flex flex-wrap items-center gap-1.5">
               {form.id && canEditBoard ? (
                 <Button
                   type="button"
@@ -1015,6 +1042,18 @@ export function OfficeBoard() {
                   }}
                 >
                   <Trash2 className="size-4" /> מחיקת משימה
+                </Button>
+              ) : null}
+              {form.event_id && canEditBoard ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const ev = eventsMap.get(form.event_id);
+                    setEqChangeEvent({ id: form.event_id, title: ev?.title ?? "אירוע" });
+                  }}
+                >
+                  <PackagePlus className="size-4 text-indigo-600" /> עדכון מפרט ציוד לאירוע (+/-)
                 </Button>
               ) : null}
             </div>
@@ -1355,6 +1394,17 @@ export function OfficeBoard() {
         onOpenChange={setUnavailOpen}
         crewMembers={activeCrew}
         userId={user?.id}
+        onSaved={refreshAll}
+      />
+
+      <EquipmentChangeDialog
+        open={!!eqChangeEvent}
+        onOpenChange={(v) => { if (!v) setEqChangeEvent(null); }}
+        eventId={eqChangeEvent?.id ?? null}
+        eventTitle={eqChangeEvent?.title}
+        source="warehouse"
+        userId={user?.id}
+        userName={profile?.full_name}
         onSaved={refreshAll}
       />
 
