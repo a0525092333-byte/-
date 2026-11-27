@@ -8,8 +8,11 @@ import {
   Boxes,
   CalendarDays,
   Camera,
+  Car,
   Check,
   CircleDollarSign,
+  ClipboardList,
+  Crown,
   ExternalLink,
   FileText,
   HardHat,
@@ -21,6 +24,7 @@ import {
   Plus,
   Printer,
   Trash2,
+  Truck,
   Users,
   Wallet,
   X,
@@ -43,10 +47,8 @@ import {
   useShifts,
 } from "@/hooks/use-data";
 import { dataApiToken, db } from "@/integrations/neon/client";
-import { dateLong, dateShort, money, num, timeRange, timeShort, todayISO, toDateInput, weekdayShort } from "@/lib/format";
+import { dateLong, dateShort, money, num, timeRange, timeShort, todayISO, weekdayShort } from "@/lib/format";
 import { isMultiDayEvent } from "@/lib/events";
-import { assignableCrew } from "@/lib/crew";
-import { CREW_ROLES, crewRolesLabel } from "@/lib/crew-roles";
 import { CHANGE_STATUS_META, CHANGE_TYPE_META, compressFieldPhoto } from "@/lib/event-report";
 import { ClientContactsList } from "@/components/clients/client-contacts-list";
 import { notifyDataChanged, setEditingActive } from "@/lib/data-events";
@@ -59,19 +61,23 @@ import { FloatingWindow } from "@/components/floating-window";
 import { EventForm } from "@/components/event-form";
 import { EventAccountingButton, EventAccountingSummaryLink } from "@/components/events/event-accounting-button";
 import { EventQuoteButton, EventQuotesSection } from "@/components/events/event-quotes";
-import { EquipmentChangeDialog } from "@/components/office/office-window";
+import {
+  EquipmentChangeDialog,
+  TASK_TYPE_META,
+  describeRideForMember,
+} from "@/components/office/office-window";
 import { isFullScope } from "@/lib/scope";
 import { NoAccessScreen } from "@/components/require-full-scope";
 import { ImageUpload } from "@/components/image-upload";
 import { cn } from "@/lib/utils";
 import type {
+  CompanyVehicle,
   DispatchTask,
   DispatchTaskCrew,
   EquipmentAssignment,
   EquipmentChangeStatus,
   EventEquipmentChange,
   EventFieldPhoto,
-  Shift,
 } from "@/lib/types";
 
 export const Route = createFileRoute("/_app/events/$id")({ component: EventDetail });
@@ -79,7 +85,7 @@ export const Route = createFileRoute("/_app/events/$id")({ component: EventDetai
 const TABS = [
   { key: "overview", label: "סקירה" },
   { key: "field", label: "תיעוד ושינויי שטח" },
-  { key: "crew", label: "צוות" },
+  { key: "crew", label: "צוות ותפעול" },
   { key: "equipment", label: "ציוד" },
   { key: "finance", label: "כספים" },
   { key: "documents", label: "מסמכים" },
@@ -95,7 +101,7 @@ function EventDetail() {
   const fullScope = isFullScope(profile, isAdmin);
   const eventsQ = useEvents();
   const clientsQ = useClients(can("clients") || can("calendar") || can("finance") || can("crew") || can("equipment") || can("office"));
-  const crewQ = useCrewMembers(can("crew") || can("office"));
+  const crewQ = useCrewMembers(Boolean(user?.id));
   const shiftsQ = useShifts(can("crew"));
   const equipmentQ = useEquipment(can("equipment"));
   const assignmentsQ = useAssignments(can("equipment"));
@@ -106,6 +112,39 @@ function EventDetail() {
   const eventDaysQ = useEventDays(id, can("calendar") || can("crew") || can("clients"));
   const dayCrewQ = useEventDayCrew(can("calendar") || can("crew") || can("clients"));
   const dayCrewNamesQ = useEventDayCrewNames(id, can("calendar") || can("crew") || can("clients"));
+
+  const eventDispatchQ = useQuery({
+    queryKey: ["event_dispatch_full", id],
+    enabled: Boolean(user?.id),
+    queryFn: async () => {
+      const [{ data: tasks }, { data: vehicles }] = await Promise.all([
+        db
+          .from<DispatchTask[]>("dispatch_tasks")
+          .select("*")
+          .eq("event_id", id)
+          .order("task_date", { ascending: true })
+          .order("sort_order", { ascending: true }),
+        db
+          .from<CompanyVehicle[]>("company_vehicles")
+          .select("*")
+          .order("sort_order", { ascending: true }),
+      ]);
+      const taskList = (tasks ?? []).sort((a, b) =>
+        `${a.task_date} ${a.warehouse_time || a.start_time || "99:99"}`.localeCompare(
+          `${b.task_date} ${b.warehouse_time || b.start_time || "99:99"}`,
+        ),
+      );
+      let crewRows: DispatchTaskCrew[] = [];
+      if (taskList.length > 0) {
+        const { data: rows } = await db
+          .from<DispatchTaskCrew[]>("dispatch_task_crew")
+          .select("*")
+          .in("task_id", taskList.map((t) => t.id));
+        crewRows = rows ?? [];
+      }
+      return { tasks: taskList, crewRows, vehicles: vehicles ?? [] };
+    },
+  });
 
   const changesQ = useQuery({
     queryKey: ["event_equipment_changes", id],
@@ -135,27 +174,13 @@ function EventDetail() {
     },
   });
 
-  const dispatchAssignedQ = useQuery({
-    queryKey: ["event_dispatch_assigned", id, user?.id],
-    enabled: Boolean(user?.id && !fullScope),
-    queryFn: async () => {
-      const { data: tasks } = await db.from<DispatchTask[]>("dispatch_tasks").select("id").eq("event_id", id);
-      const tIds = (tasks ?? []).map((t) => t.id);
-      if (!tIds.length) return [] as DispatchTaskCrew[];
-      const { data: rows } = await db.from<DispatchTaskCrew[]>("dispatch_task_crew").select("*").in("task_id", tIds);
-      return rows ?? [];
-    },
-  });
-
   const openFinance = useRouterState({ select: (state) => state.location.hash === "finance" });
   const [tab, setTab] = useState<TabKey>(openFinance && can("finance") ? "finance" : "overview");
   const [editOpen, setEditOpen] = useState(false);
   const [notes, setNotes] = useState<string | null>(null);
   const [savingNotes, setSavingNotes] = useState(false);
-  const [shiftOpen, setShiftOpen] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
   const [financeOpen, setFinanceOpen] = useState(false);
-  const [deleteShift, setDeleteShift] = useState<Shift | null>(null);
   const [deleteAssign, setDeleteAssign] = useState<EquipmentAssignment | null>(null);
   const [docName, setDocName] = useState("");
   const [docUrl, setDocUrl] = useState("");
@@ -163,7 +188,6 @@ function EventDetail() {
   const [busy, setBusy] = useState(false);
   const [deleteEventOpen, setDeleteEventOpen] = useState(false);
 
-  // תיעוד תמונות ושינויי ציוד מהשטח
   const [eqChangeOpen, setEqChangeOpen] = useState(false);
   const [resolvingChangeId, setResolvingChangeId] = useState<string | null>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
@@ -173,11 +197,32 @@ function EventDetail() {
 
   const event = (eventsQ.data ?? []).find((e) => e.id === id) ?? null;
   const client = event?.client_id ? (clientsQ.data ?? []).find((c) => c.id === event.client_id) ?? null : null;
-  const crew = assignableCrew(crewQ.data ?? [], profilesQ.data ?? []);
+  const allCrew = crewQ.data ?? [];
+  const crewMap = useMemo(() => new Map(allCrew.map((c) => [c.id, c])), [allCrew]);
   const eventDays = (eventDaysQ.data ?? []).filter((d) => d.event_id === id).sort((a, b) => a.day_date.localeCompare(b.day_date));
   const dayCrewRows = dayCrewQ.data ?? [];
   const dayCrewNames = dayCrewNamesQ.data ?? {};
-  const shifts = (shiftsQ.data ?? []).filter((s) => s.event_id === id);
+  const legacyShifts = (shiftsQ.data ?? []).filter((s) => s.event_id === id);
+  const dispatchTasks = eventDispatchQ.data?.tasks ?? [];
+  const dispatchCrewRows = eventDispatchQ.data?.crewRows ?? [];
+  const vehicleMap = useMemo(
+    () => new Map((eventDispatchQ.data?.vehicles ?? []).map((v) => [v.id, v])),
+    [eventDispatchQ.data?.vehicles],
+  );
+  const dispatchCrewByTask = useMemo(() => {
+    const m = new Map<string, DispatchTaskCrew[]>();
+    for (const r of dispatchCrewRows) {
+      const list = m.get(r.task_id) ?? [];
+      list.push(r);
+      m.set(r.task_id, list);
+    }
+    return m;
+  }, [dispatchCrewRows]);
+  const uniqueAssignedCrewCount = useMemo(
+    () => new Set(dispatchCrewRows.map((r) => r.crew_member_id)).size,
+    [dispatchCrewRows],
+  );
+
   const equipment = equipmentQ.data ?? [];
   const assignments = (assignmentsQ.data ?? []).filter((a) => a.event_id === id);
   const finance = (financeQ.data ?? []).filter((f) => f.event_id === id);
@@ -224,15 +269,15 @@ function EventDetail() {
   }
 
   const canEditEvent = fullScope && can("clients", "edit");
-  const canEditCrew = fullScope && can("crew", "edit");
+  const canOpenDispatchBoard = isAdmin || profile?.role === "warehouse" || can("office", "view");
   const canEditEquipment = fullScope && can("equipment", "edit");
   const canEditFinance = fullScope && can("finance", "edit");
   const canResolveChanges = isSuperAdmin || isAdmin || (fullScope && (can("quotes", "edit") || can("finance", "edit") || can("clients", "edit")));
-  const myCrewIds = (crewQ.data ?? []).filter((c) => c.user_id === user?.id).map((c) => c.id);
+  const myCrewIds = allCrew.filter((c) => c.user_id === user?.id).map((c) => c.id);
   const isAssignedCrew =
     myCrewIds.length > 0 &&
-    (shifts.some((s) => myCrewIds.includes(s.crew_member_id)) ||
-      (dispatchAssignedQ.data ?? []).some((dc) => myCrewIds.includes(dc.crew_member_id)) ||
+    (legacyShifts.some((s) => myCrewIds.includes(s.crew_member_id)) ||
+      dispatchCrewRows.some((dc) => myCrewIds.includes(dc.crew_member_id)) ||
       dayCrewRows.some((dc) => myCrewIds.includes(dc.crew_member_id) && eventDays.some((d) => d.id === dc.event_day_id)));
   const canViewCrewSheet =
     isSuperAdmin ||
@@ -323,19 +368,6 @@ function EventDetail() {
     }
   }
 
-  async function removeShift() {
-    if (!deleteShift) return;
-    setBusy(true);
-    const { error } = await db.from("shifts").delete().eq("id", deleteShift.id);
-    setBusy(false);
-    if (error) toast.error("לא הצלחנו למחוק את המשמרת");
-    else {
-      toast.success("המשמרת נמחקה");
-      setDeleteShift(null);
-      shiftsQ.refetch();
-    }
-  }
-
   async function addDocument() {
     if (!docUrl) {
       toast.error("נא להעלות קובץ קודם");
@@ -414,6 +446,7 @@ function EventDetail() {
   }
 
   const fieldBadgeCount = pendingEqChanges.length || fieldPhotos.length;
+  const crewBadgeCount = uniqueAssignedCrewCount || legacyShifts.length;
 
   return (
     <div>
@@ -486,7 +519,6 @@ function EventDetail() {
         </div>
       </div>
 
-      {/* באנר התראה בולט למשרד כשיש שינויי ציוד מהמחסן או מהשטח שטרם עודכנו בהצעת המחיר */}
       {pendingEqChanges.length > 0 ? (
         <div className="mb-5 rounded-xl border border-red-300 bg-red-50/70 p-3.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -595,6 +627,11 @@ function EventDetail() {
                 {fieldBadgeCount}
               </span>
             ) : null}
+            {t.key === "crew" && crewBadgeCount > 0 ? (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-extrabold text-foreground">
+                {crewBadgeCount}
+              </span>
+            ) : null}
           </button>
         ))}
       </div>
@@ -675,7 +712,8 @@ function EventDetail() {
 
             <SectionCard title="סיכום מהיר">
               <dl className="space-y-3 text-sm">
-                <SummaryRow label="משמרות משובצות" value={num(shifts.length)} />
+                <SummaryRow label="משימות תפעול בלוח" value={num(dispatchTasks.length)} />
+                <SummaryRow label="אנשי צוות משובצים" value={num(uniqueAssignedCrewCount || legacyShifts.length)} />
                 <SummaryRow label="פריטי ציוד" value={num(assignments.filter((a) => !a.returned_at).length)} />
                 <SummaryRow label="תמונות ביצוע מהשטח" value={num(fieldPhotos.length)} />
                 {fullScope && can("finance") ? <SummaryRow label="יתרה פתוחה" value={money(financeSummary.due)} /> : null}
@@ -817,60 +855,147 @@ function EventDetail() {
 
       {tab === "crew" ? (
         <SectionCard
-          title="צוות בשטח"
-          description={`${shifts.length} משמרות משובצות`}
-          action={canEditCrew ? <Button type="button" size="sm" onClick={() => setShiftOpen(true)}><Plus className="size-4" />שיבוץ משמרת</Button> : null}
-          bodyClassName="p-0"
+          title="צוות ומשימות תפעול לאירוע"
+          description="הנתונים מסונכרנים אוטומטית מלוח התפעול והשיבוץ (מקור אמת אחד לרכבים, הקמה, הפעלה ופירוק)"
+          action={
+            canOpenDispatchBoard ? (
+              <Button asChild size="sm" variant="outline">
+                <Link to="/office">
+                  <ClipboardList className="size-4" />
+                  ניהול בלוח התפעול והשיבוץ
+                </Link>
+              </Button>
+            ) : null
+          }
         >
-          {!shifts.length ? (
+          {!dispatchTasks.length && !legacyShifts.length ? (
             <EmptyState
               icon={HardHat}
-              title="אין משמרות משובצות"
-              description="שיבוץ צוות לאירוע יופיע כאן עם שעות הגעה ותפקיד."
-              action={canEditCrew ? <Button type="button" size="sm" onClick={() => setShiftOpen(true)}><Plus className="size-4" />שיבוץ משמרת</Button> : undefined}
+              title="טרם שובץ צוות לאירוע בלוח התפעול"
+              description="כל שיבוץ של הקמה, הפעלה, פירוק, רכבים וצוות מתבצע מלוח התפעול והשיבוץ ויופיע כאן אוטומטית."
+              action={
+                canOpenDispatchBoard ? (
+                  <Button asChild size="sm">
+                    <Link to="/office">
+                      <ClipboardList className="size-4" />
+                      עבור ללוח התפעול והשיבוץ
+                    </Link>
+                  </Button>
+                ) : undefined
+              }
             />
           ) : (
-            <ul className="divide-y divide-border/70">
-              {shifts.map((s) => {
-                const member = crew.find((c) => c.id === s.crew_member_id) ?? (crewQ.data ?? []).find((c) => c.id === s.crew_member_id);
-                const mine = myCrewIds.includes(s.crew_member_id);
+            <div className="space-y-3">
+              {dispatchTasks.map((task) => {
+                const meta = TASK_TYPE_META[task.task_type];
+                const tc = dispatchCrewByTask.get(task.id) ?? [];
+                const vNames = [
+                  task.vehicle_id ? vehicleMap.get(task.vehicle_id)?.name : null,
+                  ...(task.extra_vehicle_ids ?? []).map((vid) => vehicleMap.get(vid)?.name),
+                ].filter(Boolean);
+                const times = [
+                  task.warehouse_time ? `מחסן: ${timeShort(task.warehouse_time)}` : null,
+                  task.start_time ? `התחלה: ${timeShort(task.start_time)}` : null,
+                  task.end_time ? `סיום משוער: ${timeShort(task.end_time)}` : null,
+                ].filter(Boolean);
+
                 return (
-                  <li key={s.id} className="flex flex-col gap-2 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold text-foreground">{member?.full_name ?? "איש צוות"}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {s.role_title} · {timeRange(s.starts_at, s.ends_at)}{member?.phone ? ` · ${member.phone}` : ""}
+                  <div key={task.id} className={`rounded-xl border border-border bg-card p-3.5 shadow-2xs ${meta.border}`}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${meta.badge}`}>{meta.label}</span>
+                        <span className="text-sm font-bold text-foreground">
+                          {weekdayShort(task.task_date)} · {dateLong(task.task_date)}
+                        </span>
+                        {task.sub_location ? (
+                          <span className="rounded bg-background/85 px-2 py-0.5 text-xs font-semibold text-foreground">
+                            זירה: {task.sub_location}
+                          </span>
+                        ) : null}
+                      </div>
+                      {vNames.length > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-background px-2.5 py-0.5 text-xs font-bold text-foreground">
+                          <Truck className="size-3.5 text-muted-foreground" /> {vNames.join(" + ")}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {times.length > 0 ? (
+                      <p className="mt-1.5 text-xs font-medium text-muted-foreground">{times.join(" · ")}</p>
+                    ) : null}
+
+                    {!tc.length ? (
+                      <p className="mt-2 text-xs italic text-amber-800">משימה פתוחה בלוח — טרם נבחרו אנשי צוות.</p>
+                    ) : (
+                      <div className="mt-2.5 grid gap-2 sm:grid-cols-2">
+                        {tc.map((row) => {
+                          const member = crewMap.get(row.crew_member_id);
+                          const isLead = row.task_roles.some((r) => r.includes("ראש צוות"));
+                          const rideDesc = describeRideForMember(row, tc, task, crewMap, vehicleMap);
+                          return (
+                            <div key={row.id} className="rounded-lg border border-border/80 bg-background/90 p-2.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1">
+                                <span className="text-sm font-bold text-foreground">
+                                  {isLead ? <Crown className="me-1 inline size-3.5 text-amber-500" /> : null}
+                                  {member?.full_name ?? "איש צוות"}
+                                </span>
+                                {member?.phone ? (
+                                  <a href={`tel:${member.phone}`} dir="ltr" className="text-xs text-muted-foreground hover:text-primary">
+                                    {member.phone}
+                                  </a>
+                                ) : null}
+                              </div>
+                              {row.task_roles.length > 0 ? (
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                  {row.task_roles.map((r) => (
+                                    <span key={r} className="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-semibold text-indigo-900">
+                                      {r}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+                              <p className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground">
+                                {row.uses_personal_car ? <Car className="size-3.5 shrink-0 text-indigo-600" /> : <Truck className="size-3.5 shrink-0" />}
+                                <span>{rideDesc}</span>
+                              </p>
+                              {row.personal_note ? (
+                                <p className="mt-1 text-[11px] font-semibold text-indigo-800">דגש אישי: {row.personal_note}</p>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {task.equipment_notes ? (
+                      <p className="mt-2 rounded bg-purple-50 px-2.5 py-1 text-xs font-medium text-purple-950">
+                        ציוד / תצורה: {task.equipment_notes}
                       </p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <StatusPill status={s.status} />
-                      {mine && s.status !== "הגיע" ? (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={async () => {
-                            const { error } = await db.from("shifts").update({ status: "הגיע" }).eq("id", s.id);
-                            if (error) toast.error("לא הצלחנו לעדכן את הסטטוס");
-                            else {
-                              toast.success("סומן שהגעת למשמרת");
-                              shiftsQ.refetch();
-                            }
-                          }}
-                        >
-                          הגעתי
-                        </Button>
-                      ) : null}
-                      {canEditCrew ? (
-                        <button type="button" aria-label="מחיקת משמרת" onClick={() => setDeleteShift(s)} className="flex size-11 items-center justify-center rounded-lg text-muted-foreground hover:bg-red-50 hover:text-red-600">
-                          <Trash2 className="size-4" />
-                        </button>
-                      ) : null}
-                    </div>
-                  </li>
+                    ) : null}
+                    {task.ops_notes ? (
+                      <p className="mt-1 text-xs text-muted-foreground">הערות תפעול: {task.ops_notes}</p>
+                    ) : null}
+                  </div>
                 );
               })}
-            </ul>
+
+              {!dispatchTasks.length && legacyShifts.length > 0 ? (
+                <div className="rounded-xl border border-border bg-muted/20 p-3">
+                  <p className="mb-2 text-xs font-semibold text-muted-foreground">משמרות היסטוריות (לפני המעבר ללוח התפעול):</p>
+                  <ul className="divide-y divide-border/60 text-sm">
+                    {legacyShifts.map((s) => {
+                      const member = crewMap.get(s.crew_member_id);
+                      return (
+                        <li key={s.id} className="flex items-center justify-between py-2">
+                          <span>{member?.full_name ?? "איש צוות"} · {s.role_title}</span>
+                          <span className="text-xs text-muted-foreground">{timeRange(s.starts_at, s.ends_at)}</span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
           )}
         </SectionCard>
       ) : null}
@@ -1038,8 +1163,6 @@ function EventDetail() {
         }}
       />
 
-      <ShiftDialog open={shiftOpen} onOpenChange={setShiftOpen} eventId={event.id} eventDate={event.event_date} crew={crew} onSaved={() => shiftsQ.refetch()} />
-
       <AssignDialog
         open={assignOpen}
         onOpenChange={setAssignOpen}
@@ -1053,7 +1176,6 @@ function EventDetail() {
 
       <FinanceDialog open={financeOpen} onOpenChange={setFinanceOpen} eventId={event.id} userId={user?.id} onSaved={() => financeQ.refetch()} />
 
-      <ConfirmDialog open={!!deleteShift} onOpenChange={(v) => !v && setDeleteShift(null)} title="מחיקת משמרת" description="האם למחוק את המשמרת מהאירוע?" onConfirm={removeShift} busy={busy} />
       <ConfirmDialog open={!!deleteAssign} onOpenChange={(v) => !v && setDeleteAssign(null)} title="מחיקת שיבוץ ציוד" description="האם להסיר את פריט הציוד מהאירוע? הכמות הזמינה תתעדכן." onConfirm={removeAssignment} busy={busy} />
       <ConfirmDialog
         open={deleteEventOpen}
@@ -1104,105 +1226,6 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
       <dt className="text-muted-foreground">{label}</dt>
       <dd className="num font-semibold text-foreground">{value}</dd>
     </div>
-  );
-}
-
-function ShiftDialog({
-  open,
-  onOpenChange,
-  eventId,
-  eventDate,
-  crew,
-  onSaved,
-}: {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  eventId: string;
-  eventDate: string;
-  crew: import("@/lib/types").CrewMember[];
-  onSaved: () => void;
-}) {
-  const [crewId, setCrewId] = useState("");
-  const [role, setRole] = useState("טכנאי");
-  const [start, setStart] = useState(`${toDateInput(eventDate)}T14:00`);
-  const [end, setEnd] = useState(`${toDateInput(eventDate)}T23:00`);
-  const [status, setStatus] = useState("משובץ");
-  const [notes, setNotes] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    setEditingActive("shift-dialog", open);
-    return () => setEditingActive("shift-dialog", false);
-  }, [open]);
-
-  async function save(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    if (!crewId) { setError("נא לבחור איש צוות."); return; }
-    if (!start) { setError("נא לבחור שעת התחלה."); return; }
-    setBusy(true);
-    const { error: dbError } = await db.from("shifts").insert({
-      event_id: eventId,
-      crew_member_id: crewId,
-      role_title: role,
-      starts_at: new Date(start).toISOString(),
-      ends_at: end ? new Date(end).toISOString() : null,
-      status,
-      notes: notes.trim() || null,
-    });
-    setBusy(false);
-    if (dbError) { setError("לא הצלחנו לשמור את המשמרת. נסה שוב."); return; }
-    toast.success("המשמרת שובצה");
-    setCrewId("");
-    setNotes("");
-    onSaved();
-    onOpenChange(false);
-  }
-
-  return (
-    <FloatingWindow open={open} onClose={() => onOpenChange(false)} title="שיבוץ משמרת" storageKey="vincen:shift-window">
-      <form id="shift-form" onSubmit={save} className="flex h-full flex-col">
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
-          <Field label="איש צוות" htmlFor="shift-crew">
-            <Select id="shift-crew" value={crewId} onChange={(e) => setCrewId(e.target.value)}>
-              <option value="">בחירת איש צוות</option>
-              {crew.filter((c) => c.is_active).map((c) => (
-                <option key={c.id} value={c.id}>{c.full_name} · {crewRolesLabel(c)}</option>
-              ))}
-            </Select>
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="תפקיד באירוע" htmlFor="shift-role">
-              <Select id="shift-role" value={role} onChange={(e) => setRole(e.target.value)}>
-                {CREW_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
-              </Select>
-            </Field>
-            <Field label="סטטוס" htmlFor="shift-status">
-              <Select id="shift-status" value={status} onChange={(e) => setStatus(e.target.value)}>
-                {["משובץ", "אושר", "הגיע", "לא הגיע"].map((s) => <option key={s} value={s}>{s}</option>)}
-              </Select>
-            </Field>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="התחלה" htmlFor="shift-start">
-              <Input id="shift-start" type="datetime-local" value={start} onChange={(e) => setStart(e.target.value)} className="h-11" />
-            </Field>
-            <Field label="סיום" htmlFor="shift-end">
-              <Input id="shift-end" type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} className="h-11" />
-            </Field>
-          </div>
-          <Field label="הערות" htmlFor="shift-notes">
-            <Textarea id="shift-notes" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="ציוד אישי, נקודת מפגש" />
-          </Field>
-          {error ? <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
-        </div>
-        <div className="flex shrink-0 justify-end gap-2 border-t border-border p-3">
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>ביטול</Button>
-          <Button type="submit" disabled={busy}>{busy ? "שומר…" : "שיבוץ"}</Button>
-        </div>
-      </form>
-    </FloatingWindow>
   );
 }
 
